@@ -18,7 +18,7 @@ from astrbot.api.message_components import File, Image, Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_context import AstrAgentContext
-from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command import CommandFilter, GreedyStr
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.filter.permission import PermissionTypeFilter
 from astrbot.core.star.session_plugin_manager import SessionPluginManager
@@ -28,12 +28,14 @@ from astrbot.core.star.star_handler import (
     StarHandlerMetadata,
     star_handlers_registry,
 )
+from pypinyin import lazy_pinyin
 
 from .command_parameters import CommandParameters
 
 BUILTIN_MODULE = "astrbot.builtin_stars.builtin_commands.main"
 UNSUPPORTED_HANDLERS = {"reset", "stop", "new_conv", "update_dashboard"}
 MAX_OUTPUT = 16000
+COMMAND_SELECTOR = re.compile(r"[^\s:/*]+:[^\s:/*]+(?: [^\s:/*]+)*")
 
 
 class CommandEvent(AstrMessageEvent):
@@ -149,14 +151,16 @@ class CommandTool(FunctionTool):
             handler: Registered command handler.
             command_filter: Original argument parser and command filter.
         """
-        slug = re.sub(r"[^a-zA-Z0-9_]", "_", key)[:35]
-        digest = hashlib.sha256(key.encode()).hexdigest()[:12]
-        command = key.split(":", 1)[1]
+        plugin_name, command = key.split(":", 1)
+        tool_plugin_name = plugin_name.removeprefix("astrbot_plugin_")
+        command_name = "".join(lazy_pinyin(command))
+        slug = re.sub(r"[^a-zA-Z0-9_]", "_", f"{tool_plugin_name}:{command_name}")[:35]
+        digest = hashlib.sha256(key.encode()).hexdigest()[:6]
         argument_spec = CommandParameters(handler.handler, command_filter)
         super().__init__(
             name=f"cmd_{slug}_{digest}",
             description=(
-                f"Run /{command} from {key.split(':', 1)[0]} as the current user. "
+                f"Run /{command} from {plugin_name} as the current user. "
                 f"{handler.desc or 'No command description was provided.'} "
                 "Pass named arguments using the parameter schema; omit optional "
                 "fields to use their defaults. Use {} for no arguments. "
@@ -247,8 +251,7 @@ class Main(Star):
             raise ValueError(f"未知配置字段：{', '.join(sorted(unknown))}")
         allowed = config.get("allowed_commands", [])
         if not isinstance(allowed, list) or any(
-            not isinstance(key, str)
-            or not re.fullmatch(r"[^\s:/*]+:[^\s:/*]+(?: [^\s:/*]+)*", key)
+            not isinstance(key, str) or not COMMAND_SELECTOR.fullmatch(key)
             for key in allowed
         ):
             raise ValueError(
@@ -261,7 +264,9 @@ class Main(Star):
             or not 1 <= timeout <= 120
         ):
             raise ValueError("command_timeout 必须为 1 到 120 秒之间的数值。")
+        self.config = config
         self.allowed = set(allowed)
+        self._allowlist_lock = asyncio.Lock()
         self.command_timeout = timeout
         self.tools: dict[str, CommandTool] = {}
         self.unsupported: dict[str, str] = {}
@@ -571,6 +576,96 @@ class Main(Star):
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("command_tools")
+    async def manage_commands(
+        self, event: AstrMessageEvent, arguments: GreedyStr
+    ) -> None:
+        """List commands or persist an add/remove operation for administrators."""
+        action, _, key = arguments.strip().partition(" ")
+        if not action:
+            await self.list_commands(event)
+            return
+        if action not in {"add", "remove"}:
+            event.set_result(
+                "未知子命令。用法：/command_tools 查看列表；"
+                "/command_tools add 插件名:完整命令名；"
+                "/command_tools remove 插件名:完整命令名。"
+            )
+            return
+        if not COMMAND_SELECTOR.fullmatch(key):
+            event.set_result(
+                f"用法：/command_tools {action} 插件名:完整命令名。"
+                "每次填写一个命令，不含 / 或通配符；"
+                "子命令示例：my_plugin:math add。"
+            )
+            return
+        async with self._allowlist_lock:
+            if self.closed:
+                event.set_result("插件已停用，无法修改白名单。")
+                return
+            if action == "add" and key in self.allowed:
+                event.set_result(f"已在白名单中：{key}")
+                return
+            if action == "remove" and key not in self.allowed:
+                event.set_result(f"不在白名单中：{key}")
+                return
+            previous = dict(self.config)
+            allowed = list(self.config.get("allowed_commands", []))
+            if action == "add":
+                allowed.append(key)
+            else:
+                allowed = [item for item in allowed if item != key]
+            self.config["allowed_commands"] = allowed
+            try:
+                self.config.save_config()
+            except Exception:
+                self.config.clear()
+                self.config.update(previous)
+                logger.exception("Failed to save command allowlist")
+                event.set_result("保存白名单失败，本次修改未生效，详情见插件日志。")
+                return
+            self.allowed = set(allowed)
+            result = f"已{'加入' if action == 'add' else '移出'}白名单并保存：{key}"
+            try:
+                await self.refresh()
+            except Exception:
+                logger.exception("Failed to refresh tools after changing allowlist")
+                event.set_result(
+                    f"{result}\n工具刷新失败，请查看插件日志，"
+                    "排除错误后发送 /command_tools 重试刷新。"
+                )
+                return
+            if action == "add":
+                status = self.command_status(key, self.catalog().get(key, []))
+                result += f"\n当前状态：{status}"
+            else:
+                result += "\n对应工具已移除。"
+            event.set_result(result)
+
+    def command_status(
+        self, key: str, entries: list[tuple[StarHandlerMetadata, CommandFilter]]
+    ) -> str:
+        """Describe registration state without confusing allowlisting with availability."""
+        if not entries:
+            return "未找到"
+        if len(entries) != 1:
+            return "同名冲突"
+        handler = entries[0][0]
+        if (
+            handler.handler_module_path == BUILTIN_MODULE
+            and handler.handler_name in UNSUPPORTED_HANDLERS
+        ):
+            return "暂不支持"
+        if not handler.enabled or not star_map[handler.handler_module_path].activated:
+            return "原命令/插件已禁用"
+        if key not in self.allowed:
+            return "未加入白名单"
+        if key in self.unsupported:
+            return f"参数不支持：{self.unsupported[key]}"
+        tool = self.tools.get(key)
+        if tool and not tool.active:
+            return "模型工具已停用"
+        return "已注册" if tool else "未注册"
+
     async def list_commands(self, event: AstrMessageEvent) -> None:
         """Refresh tools and list qualified command selectors for administrators.
 
@@ -578,31 +673,16 @@ class Main(Star):
             event: Administrator's command event.
         """
         await self.refresh()
-        lines = ["命令工具（填写插件配置 allowed_commands 后重载插件）："]
+        lines = [
+            "命令工具：",
+            "添加：/command_tools add 插件名:完整命令名",
+            "移除：/command_tools remove 插件名:完整命令名",
+            "增删会保存到 allowed_commands 并立即刷新工具，无需重载插件。",
+        ]
         catalog = self.catalog()
         for key, entries in sorted(catalog.items()):
             tool = self.tools.get(key)
-            status = "已暴露" if tool and tool.active else "未暴露"
-            if len(entries) != 1:
-                status = "同名冲突"
-            else:
-                handler = entries[0][0]
-                if (
-                    handler.handler_module_path == BUILTIN_MODULE
-                    and handler.handler_name in UNSUPPORTED_HANDLERS
-                ):
-                    status = "第一版不支持"
-                elif (
-                    not handler.enabled
-                    or not star_map[handler.handler_module_path].activated
-                ):
-                    status = "原命令/插件已禁用"
-                elif key not in self.allowed:
-                    status = "未加入白名单"
-                elif key in self.unsupported:
-                    status = f"参数不支持：{self.unsupported[key]}"
-                elif tool and not tool.active:
-                    status = "模型工具已停用"
+            status = self.command_status(key, entries)
             lines.append(f"[{status}] {key}")
             if tool:
                 lines.append(f"  工具：{tool.name}")

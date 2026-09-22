@@ -3,7 +3,7 @@
     "description": "允许转换为模型工具的命令",
     "type": "list",
     "default": [],
-    "hint": "填写 插件名:命令，不加 /，不支持通配符。例如 builtin_commands:help、builtin_commands:provider。子命令示例：my_plugin:math add。管理员可发送 /command_tools 查看有效名称。加入白名单会允许模型以当前用户权限执行该命令及其全部参数形式。"
+    "hint": "填写 插件名:命令，不加 /，不支持通配符。例如 builtin_commands:help、builtin_commands:provider。子命令示例：my_plugin:math add。管理员可发送 /command_tools 查看有效名称，使用 /command_tools add 或 remove 加完整标识增删白名单，自动保存并立即刷新工具。加入白名单会允许模型以当前用户权限执行该命令及其全部参数形式。"
   },
   "command_timeout": {
     "description": "单次命令执行超时（秒）",

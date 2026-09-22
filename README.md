@@ -6,12 +6,12 @@
 
 ## 安装与首次配置
 
-本版已分别使用 AstrBot `4.27.4` 和 `4.28.0-beta.1` 源码通过本地回归测试，元数据版本范围为 `>=4.27,<5`。插件自身不添加额外运行依赖，使用 AstrBot 已有的依赖环境。测试隔离了平台发送，尚未完成真实聊天平台与 rollpig 的组合联调。
+本版已分别使用 AstrBot `4.27.4` 和 `4.28.0-beta.1` 源码通过本地回归测试，元数据版本范围为 `>=4.27,<5`。插件通过 `requirements.txt` 声明 `pypinyin` 依赖，用于将中文命令名转换为拼音；手动部署时需在 AstrBot 的 Python 环境中安装该依赖。测试隔离了平台发送，尚未完成真实聊天平台与 rollpig 的组合联调。
 
-1. 将本插件目录复制到运行实例的 `data/plugins/astrbot_plugin_command_tools`，或在 WebUI 上传发布 ZIP。自行打包时，ZIP 根目录必须包含 `main.py`、`command_parameters.py`、`metadata.yaml`、`_conf_schema.json`。
+1. 将本插件目录复制到运行实例的 `data/plugins/astrbot_plugin_command_tools`，或在 WebUI 上传发布 ZIP。自行打包时，ZIP 根目录必须包含 `main.py`、`command_parameters.py`、`metadata.yaml`、`_conf_schema.json`、`requirements.txt`。
 2. 在插件管理中加载插件。默认白名单为空，不会注册任何命令工具。
 3. 管理员发送 `/command_tools`，查看当前命令的完整标识和状态。这里的 `/` 使用你配置的唤醒前缀。
-4. 在插件配置中填写 `allowed_commands`，保存并重载插件。先从 `builtin_commands:help` 开始。
+4. 管理员发送 `/command_tools add builtin_commands:help`，加入白名单并立即生效。也可以在插件配置中填写 `allowed_commands`，保存并重载插件。
 5. 如使用自定义人设的工具白名单，在人设中启用生成的 `cmd_...` 工具。`/command_tools` 会显示具体工具名。
 
 配置示例：
@@ -37,9 +37,29 @@
 
 将 `builtin_commands:provider` 加入白名单会开放它的全部参数形式，包括切换模型。原管理员权限仍然生效，普通用户不能使用该命令。切换影响会话后续的模型选择，不保证当前已经开始的模型调用立即换用新服务。
 
+## 管理白名单
+
+以下命令仅限管理员使用：
+
+```text
+/command_tools
+/command_tools add builtin_commands:help
+/command_tools remove builtin_commands:help
+/command_tools add my_plugin:math add
+/command_tools remove my_plugin:math add
+```
+
+不带参数时刷新并显示命令列表。`add` 和 `remove` 每次处理一个完整命令标识，支持带空格的子命令，无需加引号；标识格式与 `allowed_commands` 一致。增删成功后自动保存配置并立即刷新工具，无需重载插件，重启后仍然保留。重复添加或移除不存在的条目只返回提示。
+
+与直接填写配置一致，格式正确但当前未找到、已禁用、存在冲突或暂不支持的命令也可以加入白名单；添加回复会显示其当前状态，加入白名单不代表已注册为工具。`remove` 也可以清理已卸载或改名的条目。移除后，尚未执行的旧工具调用会被拒绝，已经开始的执行不会被取消。
+
 ## 工具参数与结果
 
-每个命令生成一个独立工具，名称含命令标识和固定摘要，支持中文命令且避免同名插件命令互相覆盖。自 `v0.3.0` 起，工具根据原命令函数声明生成独立字段。例如 `my_plugin:math add` 的处理器为：
+每个命令生成一个独立工具。生成工具名称时，插件名去掉开头的 `astrbot_plugin_`，中文命令转换为无声调拼音，英文命令保留；其他字符仍逐个替换为下划线，可读部分仍保留前 35 个字符，末尾仍附加原始完整命令标识的 6 位 SHA-256 摘要。例如 `astrbot_plugin_rollpig:今日小猪` 对应 `cmd_rollpig_jinrixiaozhu_515b46`，`builtin_commands:help` 对应 `cmd_builtin_commands_help_18fcf1`。`allowed_commands` 和工具描述继续使用原始插件名与命令名。
+
+工具命名规则调整后，请重新核对按工具名保存的人设工具白名单和工具停用设置。
+
+自 `v0.3.0` 起，工具根据原命令函数声明生成独立字段。例如 `my_plugin:math add` 的处理器为：
 
 ```python
 async def add(self, event, a: int, b: int = 2):
@@ -76,27 +96,6 @@ async def add(self, event, a: int, b: int = 2):
 
 执行时先检查权限，再校验结构化参数并直接以命名参数调用处理器，不经过原命令过滤器的空格拆分和类型转换。合成事件的 `parsed_params` 提供填充默认值后的参数副本；`message_str` 按声明顺序拼接命令和参数，仅供过滤器及日志使用，其中布尔值和空值显示为 `true` / `false` / `null`。命令及父组的自定义过滤器仍会检查，其他平台、消息类型过滤器照常执行。自行从消息文本重新解析业务参数的处理器，需要单独适配。
 
-### 从 v0.2.x 升级
-
-更新并重载本插件后，发送 `/command_tools` 检查命令状态，后续模型请求会获得新参数声明。配置格式、命令白名单和工具名称不变。旧的 `{"arguments": "1 2"}` 包装接口已移除，调用时会明确报错；请更新人设或提示词中的旧调用示例。若原函数自身声明了名为 `arguments` 的业务参数，该字段按普通声明处理，不作为旧接口别名。
-
-工具处理 `yield`、`event.set_result(...)`、协程返回的 `MessageEventResult` 和 `await event.send(...)`。纯文本回复（包括进度文本）收集后统一返回模型，不单独发送到聊天平台。含 `Image` 或 `File` 的消息链通过原始事件的 `send()` 立即发送到当前聊天会话，保留链中的文本、组件顺序和消息格式设置；其中的文本也会收集到工具结果。发送完成后才继续执行命令，支持命令在 `send` 或 `yield` 后清理临时图片。图片可以使用 AstrBot 标准的本地文件、URL 或 Base64 组件，具体发送能力由当前平台适配器决定。
-
-文本命令的结果示例：
-
-```json
-{
-  "status": "ok",
-  "command": "builtin_commands:help",
-  "sent_messages": 0,
-  "output": "AstrBot v..."
-}
-```
-
-`sent_messages` 是含图片或文件的消息链成功完成适配器发送调用的次数，不是图片/文件数量，也不是平台送达回执。只有媒体、没有文本时，`output` 会提示“已向当前会话发送 N 条含图片或文件的消息”。模型获得文本和发送计数，不会收到图片二进制内容；工具描述提示模型不要重复发送或声称看过图片内容。
-
-`status=ok` 表示处理器正常结束；原命令可能在文本中报告业务失败，模型仍需读取 `output`。既无文本也无媒体发送时明确提示无法确认业务成功。文本最多保留 16000 字符，截断会标注。权限不足、参数错误、超时和不支持的结果返回 `status=error`，不会自动尝试其他命令。媒体发送异常即使被原命令捕获，也会返回错误；先前已完成的发送仍计入 `sent_messages`，不会自动重试。
-
 ## 权限与生命周期
 
 - 使用真实消息的用户角色、平台、群组和会话；模型无法提供或修改执行身份。
@@ -122,9 +121,10 @@ async def add(self, event, a: int, b: int = 2):
 
 ## 本地验证
 
-使用包含 AstrBot 和 pytest、pytest-asyncio、ruff 的开发环境。插件与 AstrBot 源码位于同一上级目录时，在插件目录执行：
+使用包含 AstrBot 和 pytest、pytest-asyncio、ruff 的开发环境，并安装 `requirements.txt` 中的依赖。插件与 AstrBot 源码位于同一上级目录时，在插件目录执行：
 
 ```powershell
+../AstrBot/.venv/Scripts/python.exe -m pip install -r requirements.txt
 ../AstrBot/.venv/Scripts/python.exe -m pytest -q
 ../AstrBot/.venv/Scripts/ruff.exe format .
 ../AstrBot/.venv/Scripts/ruff.exe check .

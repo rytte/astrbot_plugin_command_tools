@@ -4,9 +4,10 @@ import asyncio
 import functools
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
+from astrbot.api import AstrBotConfig
 from astrbot.api.event import MessageChain, filter
 from astrbot.api.message_components import At, File, Image, Plain
 from astrbot.core.agent.run_context import ContextWrapper
@@ -15,7 +16,11 @@ from astrbot.core.star.filter.command import CommandFilter, GreedyStr
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.filter.permission import PermissionType, PermissionTypeFilter
 from astrbot.core.star.star import StarMetadata
-from astrbot.core.star.star_handler import EventType, StarHandlerMetadata
+from astrbot.core.star.star_handler import (
+    EventType,
+    StarHandlerMetadata,
+    star_handlers_registry,
+)
 
 
 def register(
@@ -1019,3 +1024,210 @@ async def test_declared_arguments_field_is_a_business_parameter(env):
     tool = plugin.tools["sample:echo"]
     assert (await invoke(env, tool, arguments=3))["output"] == "3"
     assert (await invoke(env, tool, arguments="3"))["status"] == "error"
+
+
+@pytest.fixture
+async def management(env, tmp_path):
+    """Use real configuration persistence and the decorated management filters."""
+    path = tmp_path / "plugin.json"
+    config = AstrBotConfig(
+        str(path), default_config={"allowed_commands": [], "command_timeout": 7}
+    )
+    plugin = env.bridge.Main(env.context, config)
+    await plugin.initialize()
+    handler = next(
+        item
+        for item in star_handlers_registry
+        if item.handler_module_path == env.bridge.__name__
+        and item.handler_name == "manage_commands"
+    )
+
+    async def send(arguments="", role="admin"):
+        event = env.event
+        event.role = role
+        event.is_at_or_wake_command = True
+        event.message_str = "command_tools" + (f" {arguments}" if arguments else "")
+        event.clear_result()
+        if all(rule.filter(event, env.config) for rule in handler.event_filters):
+            await plugin.manage_commands(event, **event.get_extra("parsed_params"))
+        result = event.get_result()
+        return result.get_plain_text() if result else ""
+
+    return SimpleNamespace(plugin=plugin, config=config, path=path, send=send)
+
+
+async def test_management_persists_add_remove_and_invalidates_cached_tool(
+    env, management
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    register(env, echo)
+    listing = await management.send()
+    assert "[未加入白名单] sample:echo" in listing
+    assert "command_tools add" in listing and "command_tools remove" in listing
+    added = await management.send("add sample:echo")
+    assert "已加入白名单并保存" in added and "已注册" in added
+    tool = management.plugin.tools["sample:echo"]
+    assert tool in env.manager.func_list
+    assert (await invoke(env, tool))["output"] == "ok"
+    saved = json.loads(management.path.read_text(encoding="utf-8-sig"))
+    assert saved == {"allowed_commands": ["sample:echo"], "command_timeout": 7}
+
+    reloaded_config = AstrBotConfig(
+        str(management.path), default_config=management.config.default_config
+    )
+    reloaded = env.bridge.Main(env.context, reloaded_config)
+    assert reloaded.allowed == {"sample:echo"}
+
+    removed = await management.send("remove sample:echo")
+    assert "已移出白名单并保存" in removed
+    assert not management.plugin.allowed and not management.plugin.tools
+    assert tool not in env.manager.func_list
+    assert (await invoke(env, tool))["status"] == "error"
+    assert json.loads(management.path.read_text(encoding="utf-8-sig")) == {
+        "allowed_commands": [],
+        "command_timeout": 7,
+    }
+
+
+async def test_management_handles_full_subcommand_and_missing_entries(env, management):
+    async def echo(self, event):
+        pass
+
+    register(env, echo, command="add", parents=["math"])
+    reply = await management.send("add sample:math add")
+    assert "已注册" in reply
+    assert "sample:math add" in management.plugin.tools
+    assert "未找到" in await management.send("add absent:old command")
+    assert management.config["allowed_commands"] == [
+        "sample:math add",
+        "absent:old command",
+    ]
+    assert "[未找到] absent:old command" in await management.send()
+    await management.send("remove absent:old command")
+    await management.send("remove sample:math add")
+    assert not management.config["allowed_commands"]
+    assert not management.plugin.tools
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "add sample:echo",
+        "remove sample:echo",
+        "",
+    ],
+)
+async def test_management_requires_admin(management, arguments):
+    assert await management.send(arguments, role="member") == ""
+    assert not management.config["allowed_commands"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        "add",
+        "remove",
+        "add help",
+        "remove sample:/echo",
+        "add *:echo",
+        "add sample:echo other:command",
+        "add sample:echo:extra",
+        "update sample:echo",
+    ],
+)
+async def test_management_rejects_invalid_input_without_saving(
+    management, monkeypatch, arguments
+):
+    save = Mock(side_effect=AssertionError("Invalid input must not be saved"))
+    monkeypatch.setattr(AstrBotConfig, "save_config", save)
+    assert "用法" in await management.send(arguments)
+    assert not management.plugin.allowed and not management.config["allowed_commands"]
+    save.assert_not_called()
+
+
+async def test_management_duplicate_and_absent_changes_do_not_save(
+    management, monkeypatch
+):
+    await management.send("add sample:missing")
+    save = Mock(side_effect=AssertionError("No-op changes must not be saved"))
+    monkeypatch.setattr(AstrBotConfig, "save_config", save)
+    assert "已在白名单中" in await management.send("add sample:missing")
+    assert "不在白名单中" in await management.send("remove sample:absent")
+    assert management.config["allowed_commands"] == ["sample:missing"]
+    save.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["add", "remove"])
+async def test_management_save_failure_preserves_config_and_tools(
+    env, management, monkeypatch, action
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    register(env, echo)
+    if action == "remove":
+        await management.send("add sample:echo")
+    previous_config = dict(management.config)
+    previous_tools = dict(management.plugin.tools)
+    previous_file = management.path.read_bytes()
+    monkeypatch.setattr(
+        AstrBotConfig, "save_config", Mock(side_effect=OSError("Disk unavailable"))
+    )
+    reply = await management.send(f"{action} sample:echo")
+    assert "保存白名单失败" in reply and "未生效" in reply
+    assert management.config == previous_config
+    assert management.path.read_bytes() == previous_file
+    assert management.plugin.allowed == set(previous_config["allowed_commands"])
+    assert management.plugin.tools == previous_tools
+    assert env.manager.func_list == list(previous_tools.values())
+
+
+async def test_management_reports_refresh_failure_and_still_revokes_command(
+    env, management, monkeypatch
+):
+    async def echo(self, event):
+        pytest.fail("Removed command must not execute even if refresh fails")
+
+    register(env, echo)
+    await management.send("add sample:echo")
+    tool = management.plugin.tools["sample:echo"]
+    monkeypatch.setattr(
+        management.plugin, "refresh", AsyncMock(side_effect=ValueError("Tool conflict"))
+    )
+    reply = await management.send("remove sample:echo")
+    assert "已移出白名单并保存" in reply and "工具刷新失败" in reply
+    assert not management.plugin.allowed
+    assert (
+        json.loads(management.path.read_text(encoding="utf-8-sig"))["allowed_commands"]
+        == []
+    )
+    assert (await invoke(env, tool))["status"] == "error"
+
+
+async def test_management_serializes_edits_and_rejects_changes_after_termination(
+    env, management, monkeypatch
+):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    refresh = management.plugin.refresh
+
+    async def delayed_refresh():
+        entered.set()
+        await release.wait()
+        await refresh()
+
+    monkeypatch.setattr(management.plugin, "refresh", delayed_refresh)
+    first = asyncio.create_task(management.send("add sample:first"))
+    await entered.wait()
+    second_event = env.bridge.CommandEvent(env.event, "command_tools add sample:second")
+    second = asyncio.create_task(
+        management.plugin.manage_commands(second_event, "add sample:second")
+    )
+    release.set()
+    await asyncio.gather(first, second)
+    assert management.config["allowed_commands"] == ["sample:first", "sample:second"]
+    await management.plugin.terminate()
+    assert "插件已停用" in await management.send("add sample:third")
+    assert management.config["allowed_commands"] == ["sample:first", "sample:second"]
