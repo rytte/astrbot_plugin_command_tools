@@ -74,19 +74,19 @@ async def make_plugin(env, allowed):
     return plugin
 
 
-async def invoke(env, tool, arguments=""):
+async def invoke(env, tool, **arguments):
     """Call the actual model-tool entry point.
 
     Args:
         env: Isolated environment.
         tool: Registered command tool.
-        arguments: Raw command argument text.
+        arguments: Named command arguments.
 
     Returns:
         Parsed tool result envelope.
     """
     context = ContextWrapper(SimpleNamespace(event=env.event, context=env.context))
-    return json.loads(await tool.call(context, arguments=arguments))
+    return json.loads(await tool.call(context, **arguments))
 
 
 @pytest.mark.parametrize(
@@ -142,7 +142,7 @@ async def test_real_executor_collects_send_yield_and_result_with_isolation(env):
     results = [
         item
         async for item in FunctionToolExecutor.execute(
-            tool, context, arguments="2 hello world"
+            tool, context, count=2, text="hello world"
         )
     ]
     result = json.loads(results[0].content[0].text)
@@ -170,13 +170,13 @@ async def test_permission_before_argument_parsing(env):
     register(env, echo, extra_filters=[PermissionTypeFilter(PermissionType.ADMIN)])
     plugin = await make_plugin(env, ["sample:echo"])
     tool = plugin.tools["sample:echo"]
-    result = await invoke(env, tool, "invalid")
+    result = await invoke(env, tool, count="invalid")
     assert result["status"] == "error" and "权限" in result["error"]
     assert not calls
     env.event.role = "admin"
-    assert (await invoke(env, tool, "3"))["output"] == "3"
-    for args in ("", "abc", "3 extra"):
-        assert (await invoke(env, tool, args))["status"] == "error"
+    assert (await invoke(env, tool, count=3))["output"] == "3"
+    for args in ({}, {"count": "abc"}, {"count": 3, "extra": 4}):
+        assert (await invoke(env, tool, **args))["status"] == "error"
     assert calls == [3]
 
 
@@ -539,7 +539,7 @@ async def test_nested_group_and_generator_cleanup(env):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {},
+        {"arguments": ""},
         {"arguments": 2},
         {"arguments": "", "user_id": "admin"},
         {"arguments": "a" * 2001},
@@ -685,3 +685,337 @@ async def test_builtin_help_provider_and_lifecycle_exclusion(env, monkeypatch):
     env.event.role = "admin"
     result = await invoke(env, provider_tool)
     assert result["status"] == "ok" and "LLM Providers" in result["output"]
+
+
+async def test_structured_schema_types_required_defaults_and_empty_command(env):
+    async def echo(
+        self,
+        event,
+        count: int,
+        text: str,
+        scale: float = 1.5,
+        enabled: bool = False,
+        target: str | int | None = None,
+    ):
+        event.set_result(json.dumps([count, text, scale, enabled, target]))
+
+    register(env, echo)
+    plugin = await make_plugin(env, ["sample:echo"])
+    tool = plugin.tools["sample:echo"]
+    schema = tool.parameters
+    assert schema["required"] == ["count", "text"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["count"] == {"type": "integer"}
+    assert schema["properties"]["enabled"] == {"type": "boolean", "default": False}
+    assert schema["properties"]["scale"] == {"type": "number", "default": 1.5}
+    assert schema["properties"]["target"]["anyOf"] == [
+        {"type": "string", "maxLength": 2000},
+        {"type": "integer"},
+        {"type": "null"},
+    ]
+    result = await invoke(env, tool, text="hello world", count=2, target=7)
+    assert result["status"] == "ok"
+    assert json.loads(result["output"]) == [2, "hello world", 1.5, False, 7]
+
+    async def empty(self, event):
+        event.set_result("no args")
+
+    register(env, empty, command="empty")
+    plugin.allowed.add("sample:empty")
+    await plugin.refresh()
+    empty_tool = plugin.tools["sample:empty"]
+    assert empty_tool.parameters == {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+    assert (await invoke(env, empty_tool))["output"] == "no args"
+    result = await invoke(env, empty_tool, arguments="")
+    assert result["status"] == "error" and "arguments" in result["error"]
+
+
+@pytest.mark.parametrize("value", [12, "0012", None])
+async def test_nullable_union_preserves_supplied_type(env, value):
+    async def echo(self, event, target: int | str | None):
+        assert type(target) is type(value)
+        assert target == value
+        event.set_result("ok")
+
+    register(env, echo)
+    plugin = await make_plugin(env, ["sample:echo"])
+    tool = plugin.tools["sample:echo"]
+    assert (await invoke(env, tool))["status"] == "error"
+    assert (await invoke(env, tool, target=value))["status"] == "ok"
+
+
+async def test_optional_field_omission_differs_from_explicit_null(env):
+    async def echo(self, event, value: str | None = "default", other: int = 2):
+        event.set_result(json.dumps([value, other]))
+
+    register(env, echo)
+    plugin = await make_plugin(env, ["sample:echo"])
+    tool = plugin.tools["sample:echo"]
+    result = await invoke(env, tool, other=9)
+    assert json.loads(result["output"]) == ["default", 9]
+    result = await invoke(env, tool, value=None)
+    assert json.loads(result["output"]) == [None, 2]
+
+
+@pytest.mark.parametrize("text", ["", '  中文  "text"\nline\tend  '])
+async def test_strings_and_greedy_text_preserve_whitespace(env, text):
+    async def echo(self, event, ordinary: str, rest: GreedyStr):
+        assert ordinary == rest == text
+        assert event.get_extra("parsed_params") == {"ordinary": text, "rest": text}
+        event.set_result("ok")
+
+    register(env, echo)
+    plugin = await make_plugin(env, ["sample:echo"])
+    assert (await invoke(env, plugin.tools["sample:echo"], ordinary=text, rest=text))[
+        "status"
+    ] == "ok"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"count": "2"},
+        {"count": True},
+        {"count": 2.5},
+        {"count": None},
+        {"scale": True},
+        {"scale": float("nan")},
+        {"scale": float("inf")},
+        {"enabled": "false"},
+        {"enabled": 0},
+        {"text": 3},
+        {"text": []},
+        {"text": {}},
+        {"text": "a" * 2001},
+        {"target": False},
+        {"extra": "unexpected"},
+        {"arguments": "2 x"},
+    ],
+)
+async def test_structured_values_are_validated_before_filters_or_handler(
+    env, overrides
+):
+    calls = []
+
+    async def echo(
+        self,
+        event,
+        count: int,
+        text: str,
+        scale: float = 1.5,
+        enabled: bool = False,
+        target: int | str | None = None,
+    ):
+        pytest.fail("Invalid values must not run the handler")
+
+    _, command_filter = register(env, echo)
+    command_filter.add_custom_filter(
+        SimpleNamespace(filter=lambda event, cfg: calls.append(True))
+    )
+    plugin = await make_plugin(env, ["sample:echo"])
+    result = await invoke(
+        env, plugin.tools["sample:echo"], **{"count": 2, "text": "ok", **overrides}
+    )
+    assert result["status"] == "error" and "参数" in result["error"]
+    assert calls == []
+    env.event.send.assert_not_awaited()
+
+
+async def test_argument_total_length_limit(env):
+    async def echo(self, event, a: str, b: str):
+        pytest.fail("Oversized arguments must not run")
+
+    register(env, echo)
+    plugin = await make_plugin(env, ["sample:echo"])
+    result = await invoke(env, plugin.tools["sample:echo"], a="a" * 1000, b="b" * 1000)
+    assert result["status"] == "error" and "合计" in result["error"]
+
+
+async def test_resolved_annotations_default_inference_and_keyword_only_params(env):
+    async def echo(
+        self, event, count: "int", *, enabled=False, context: str = "default"
+    ):
+        event.set_result(json.dumps([count, enabled, context]))
+
+    register(env, echo)
+    plugin = await make_plugin(env, ["sample:echo"])
+    tool = plugin.tools["sample:echo"]
+    assert tool.parameters["properties"]["enabled"]["type"] == "boolean"
+    result = await invoke(env, tool, count=3, enabled=True, context="custom")
+    assert result["status"] == "ok"
+    assert json.loads(result["output"]) == [3, True, "custom"]
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "value",
+        "value=None",
+        "value: list[str]",
+        "value: int = None",
+        "value: str = 1",
+        "*values: str",
+        "**values: str",
+        "value: int, /",
+    ],
+)
+async def test_unsupported_declarations_are_reported_without_breaking_other_tools(
+    env, declaration
+):
+    namespace = {}
+    exec(f"async def unsupported(self, event, {declaration}):\n    pass", namespace)
+    register(env, namespace["unsupported"], command="unsupported")
+
+    async def echo(self, event):
+        event.set_result("ok")
+
+    register(env, echo)
+    plugin = await make_plugin(env, ["sample:echo", "sample:unsupported"])
+    assert list(plugin.tools) == ["sample:echo"]
+    assert "sample:unsupported" in plugin.unsupported
+    assert (await invoke(env, plugin.tools["sample:echo"]))["output"] == "ok"
+    await plugin.list_commands(env.event)
+    listing = env.event.get_result().get_plain_text()
+    assert "参数不支持：" in listing and "sample:unsupported" in listing
+
+
+async def test_subcommand_keeps_parent_and_leaf_filters_with_structured_args(env):
+    checked = []
+
+    async def echo(self, event, a: int, b: int = 2):
+        event.set_result(str(a + b))
+
+    _, leaf = register(env, echo, parents=["math"])
+    group = CommandGroupFilter("math")
+    group.add_sub_command_filter(leaf)
+    env.registry.append(
+        StarHandlerMetadata(
+            EventType.AdapterMessageEvent,
+            "tests.commands_math",
+            "math",
+            "tests.commands",
+            echo,
+            [group, PermissionTypeFilter(PermissionType.ADMIN)],
+        )
+    )
+
+    def custom_filter(event, cfg):
+        checked.append(event.get_message_str())
+        return event.get_extra("parsed_params") == {"a": 3, "b": 2}
+
+    group.add_custom_filter(SimpleNamespace(filter=custom_filter))
+    leaf.add_custom_filter(SimpleNamespace(filter=custom_filter))
+    plugin = await make_plugin(env, ["sample:math echo"])
+    tool = plugin.tools["sample:math echo"]
+    assert (await invoke(env, tool, a=3))["status"] == "error"
+    assert checked == []
+    env.event.role = "admin"
+    assert (await invoke(env, tool, a=3))["output"] == "5"
+    assert checked == ["math echo 3 2", "math echo 3 2"]
+    checked.clear()
+    assert (await invoke(env, tool, a=1))["status"] == "error"
+    assert checked == ["math echo 1 2"]
+
+
+async def test_schema_refresh_invalidates_old_calls_and_keeps_disabled_state(env):
+    async def echo(self, event, value=1):
+        event.set_result(str(value))
+
+    handler, _ = register(env, echo)
+    plugin = await make_plugin(env, ["sample:echo"])
+    original = plugin.tools["sample:echo"]
+
+    # bool and int defaults compare equal in Python; their schemas must still differ.
+    async def changed(event, value=True):
+        event.set_result(str(value))
+
+    handler.handler = changed
+    result = await invoke(env, original, value=1)
+    assert result["status"] == "error" and "参数声明已变更" in result["error"]
+    original.active = False
+    await plugin.refresh()
+    updated = plugin.tools["sample:echo"]
+    assert updated is not original and updated.name == original.name
+    assert updated.parameters["properties"]["value"]["type"] == "boolean"
+    assert not updated.active
+    updated.active = True
+    assert (await invoke(env, original, value=1))["status"] == "error"
+    assert (await invoke(env, updated, value=False))["output"] == "False"
+
+
+async def test_builtin_provider_declared_fields_are_passed_by_name(env, monkeypatch):
+    from astrbot.builtin_stars.builtin_commands.main import Main as Builtins
+
+    module = env.bridge.BUILTIN_MODULE
+    monkeypatch.setitem(
+        env.bridge.star_map,
+        module,
+        StarMetadata(
+            name="builtin_commands",
+            module_path=module,
+            reserved=True,
+        ),
+    )
+    handler, _ = register(env, Builtins.provider, command="provider", module=module)
+    provider = AsyncMock()
+    handler.handler = functools.partial(
+        Builtins.provider,
+        SimpleNamespace(
+            provider_c=SimpleNamespace(provider=provider),
+        ),
+    )
+    plugin = await make_plugin(env, ["builtin_commands:provider"])
+    result = await invoke(env, plugin.tools["builtin_commands:provider"], idx=2)
+    assert result["status"] == "ok"
+    assert provider.await_args.args[1:] == (2, None)
+
+
+async def test_custom_filter_cannot_redirect_the_selected_command(env):
+    async def echo(self, event, count: int):
+        pytest.fail("A command name mismatch must not execute")
+
+    def redirect(event, cfg):
+        event.message_str = "another 2"
+        return True
+
+    _, command_filter = register(env, echo)
+    command_filter.add_custom_filter(SimpleNamespace(filter=redirect))
+    plugin = await make_plugin(env, ["sample:echo"])
+    assert (await invoke(env, plugin.tools["sample:echo"], count=2))[
+        "status"
+    ] == "error"
+
+
+async def test_custom_command_filter_subclass_is_explicitly_rejected(env):
+    class RestrictedCommandFilter(CommandFilter):
+        def filter(self, event, cfg):
+            return False
+
+    async def echo(self, event, count: int):
+        pytest.fail("Overridden command filters must never be bypassed")
+
+    handler, _ = register(env, echo)
+    # Registration inspects an unbound self/event function before loader binding.
+    handler.handler = echo
+    restricted = RestrictedCommandFilter("echo", handler_md=handler)
+    handler.handler = functools.partial(echo, SimpleNamespace())
+    handler.event_filters = [restricted]
+    plugin = await make_plugin(env, ["sample:echo"])
+    assert not plugin.tools
+    assert "自定义 CommandFilter" in plugin.unsupported["sample:echo"]
+
+
+async def test_declared_arguments_field_is_a_business_parameter(env):
+    async def echo(self, event, arguments: int):
+        event.set_result(str(arguments))
+
+    register(env, echo)
+    plugin = await make_plugin(env, ["sample:echo"])
+    tool = plugin.tools["sample:echo"]
+    assert (await invoke(env, tool, arguments=3))["output"] == "3"
+    assert (await invoke(env, tool, arguments="3"))["status"] == "error"

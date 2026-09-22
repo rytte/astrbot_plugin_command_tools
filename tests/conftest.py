@@ -28,7 +28,9 @@ from astrbot.core.star.star import StarMetadata  # noqa: E402
 from astrbot.core.star.star_handler import StarHandlerRegistry  # noqa: E402
 
 spec = importlib.util.spec_from_file_location(
-    "command_tools_test_plugin", PLUGIN_DIR / "main.py"
+    "command_tools_test_plugin",
+    PLUGIN_DIR / "main.py",
+    submodule_search_locations=[str(PLUGIN_DIR)],
 )
 bridge = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = bridge
