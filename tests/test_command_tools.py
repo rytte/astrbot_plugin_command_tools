@@ -1046,7 +1046,7 @@ async def management(env, tmp_path):
         event = env.event
         event.role = role
         event.is_at_or_wake_command = True
-        event.message_str = "command_tools" + (f" {arguments}" if arguments else "")
+        event.message_str = "cmdtools" + (f" {arguments}" if arguments else "")
         event.clear_result()
         if all(rule.filter(event, env.config) for rule in handler.event_filters):
             await plugin.manage_commands(event, **event.get_extra("parsed_params"))
@@ -1065,7 +1065,7 @@ async def test_management_persists_add_remove_and_invalidates_cached_tool(
     register(env, echo)
     listing = await management.send()
     assert "[未加入白名单] sample:echo" in listing
-    assert "command_tools add" in listing and "command_tools remove" in listing
+    assert "cmdtools add" in listing and "cmdtools remove" in listing
     added = await management.send("add sample:echo")
     assert "已加入白名单并保存" in added and "已注册" in added
     tool = management.plugin.tools["sample:echo"]
@@ -1221,7 +1221,7 @@ async def test_management_serializes_edits_and_rejects_changes_after_termination
     monkeypatch.setattr(management.plugin, "refresh", delayed_refresh)
     first = asyncio.create_task(management.send("add sample:first"))
     await entered.wait()
-    second_event = env.bridge.CommandEvent(env.event, "command_tools add sample:second")
+    second_event = env.bridge.CommandEvent(env.event, "cmdtools add sample:second")
     second = asyncio.create_task(
         management.plugin.manage_commands(second_event, "add sample:second")
     )

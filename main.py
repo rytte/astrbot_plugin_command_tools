@@ -575,7 +575,7 @@ class Main(Star):
         await self.refresh()
 
     @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("command_tools")
+    @filter.command("cmdtools")
     async def manage_commands(
         self, event: AstrMessageEvent, arguments: GreedyStr
     ) -> None:
@@ -586,14 +586,14 @@ class Main(Star):
             return
         if action not in {"add", "remove"}:
             event.set_result(
-                "未知子命令。用法：/command_tools 查看列表；"
-                "/command_tools add 插件名:完整命令名；"
-                "/command_tools remove 插件名:完整命令名。"
+                "未知子命令。用法：/cmdtools 查看列表；"
+                "/cmdtools add 插件名:完整命令名；"
+                "/cmdtools remove 插件名:完整命令名。"
             )
             return
         if not COMMAND_SELECTOR.fullmatch(key):
             event.set_result(
-                f"用法：/command_tools {action} 插件名:完整命令名。"
+                f"用法：/cmdtools {action} 插件名:完整命令名。"
                 "每次填写一个命令，不含 / 或通配符；"
                 "子命令示例：my_plugin:math add。"
             )
@@ -631,7 +631,7 @@ class Main(Star):
                 logger.exception("Failed to refresh tools after changing allowlist")
                 event.set_result(
                     f"{result}\n工具刷新失败，请查看插件日志，"
-                    "排除错误后发送 /command_tools 重试刷新。"
+                    "排除错误后发送 /cmdtools 重试刷新。"
                 )
                 return
             if action == "add":
@@ -675,8 +675,8 @@ class Main(Star):
         await self.refresh()
         lines = [
             "命令工具：",
-            "添加：/command_tools add 插件名:完整命令名",
-            "移除：/command_tools remove 插件名:完整命令名",
+            "添加：/cmdtools add 插件名:完整命令名",
+            "移除：/cmdtools remove 插件名:完整命令名",
             "增删会保存到 allowed_commands 并立即刷新工具，无需重载插件。",
         ]
         catalog = self.catalog()

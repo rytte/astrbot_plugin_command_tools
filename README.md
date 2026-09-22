@@ -10,9 +10,9 @@
 
 1. 将本插件目录复制到运行实例的 `data/plugins/astrbot_plugin_command_tools`，或在 WebUI 上传发布 ZIP。自行打包时，ZIP 根目录必须包含 `main.py`、`command_parameters.py`、`metadata.yaml`、`_conf_schema.json`、`requirements.txt`。
 2. 在插件管理中加载插件。默认白名单为空，不会注册任何命令工具。
-3. 管理员发送 `/command_tools`，查看当前命令的完整标识和状态。这里的 `/` 使用你配置的唤醒前缀。
-4. 管理员发送 `/command_tools add builtin_commands:help`，加入白名单并立即生效。也可以在插件配置中填写 `allowed_commands`，保存并重载插件。
-5. 如使用自定义人设的工具白名单，在人设中启用生成的 `cmd_...` 工具。`/command_tools` 会显示具体工具名。
+3. 管理员发送 `/cmdtools`，查看当前命令的完整标识和状态。这里的 `/` 使用你配置的唤醒前缀。
+4. 管理员发送 `/cmdtools add builtin_commands:help`，加入白名单并立即生效。也可以在插件配置中填写 `allowed_commands`，保存并重载插件。
+5. 如使用自定义人设的工具白名单，在人设中启用生成的 `cmd_...` 工具。`/cmdtools` 会显示具体工具名。
 
 配置示例：
 
@@ -33,7 +33,7 @@
 | `allowed_commands` | `插件名:完整命令名` 列表；默认 `[]`；不含 `/`，不支持通配符 |
 | `command_timeout` | 单次命令超时，默认 30 秒，范围 1–120 秒 |
 
-插件名使用目标插件元数据的 `name`；子命令如 `my_plugin:math add`，以 `/command_tools` 输出为准。使用当前有效主命令名，不将别名另外注册为工具。未知配置字段和错误配置格式会直接报错。
+插件名使用目标插件元数据的 `name`；子命令如 `my_plugin:math add`，以 `/cmdtools` 输出为准。使用当前有效主命令名，不将别名另外注册为工具。未知配置字段和错误配置格式会直接报错。
 
 将 `builtin_commands:provider` 加入白名单会开放它的全部参数形式，包括切换模型。原管理员权限仍然生效，普通用户不能使用该命令。切换影响会话后续的模型选择，不保证当前已经开始的模型调用立即换用新服务。
 
@@ -42,11 +42,11 @@
 以下命令仅限管理员使用：
 
 ```text
-/command_tools
-/command_tools add builtin_commands:help
-/command_tools remove builtin_commands:help
-/command_tools add my_plugin:math add
-/command_tools remove my_plugin:math add
+/cmdtools
+/cmdtools add builtin_commands:help
+/cmdtools remove builtin_commands:help
+/cmdtools add my_plugin:math add
+/cmdtools remove my_plugin:math add
 ```
 
 不带参数时刷新并显示命令列表。`add` 和 `remove` 每次处理一个完整命令标识，支持带空格的子命令，无需加引号；标识格式与 `allowed_commands` 一致。增删成功后自动保存配置并立即刷新工具，无需重载插件，重启后仍然保留。重复添加或移除不存在的条目只返回提示。
@@ -90,7 +90,7 @@ async def add(self, event, a: int, b: int = 2):
 | `T \| None`、`Optional[T]` | 接受 `null`；是否可以省略仍由函数有没有默认值决定 |
 | 带默认值的参数 | 可省略，使用声明的默认值；可只指定后面的可选参数 |
 
-没有类型注解但具有明确的字符串、整数、浮点数或布尔默认值时，按该默认值的类型生成字段。没有注解且没有默认值、仅有 `None` 默认值、默认值与注解矛盾、列表/字典/自定义类型、位置专用参数及 `*args` / `**kwargs` 都会拒绝暴露，并在日志和 `/command_tools` 中显示原因，不退回字符串模式。
+没有类型注解但具有明确的字符串、整数、浮点数或布尔默认值时，按该默认值的类型生成字段。没有注解且没有默认值、仅有 `None` 默认值、默认值与注解矛盾、列表/字典/自定义类型、位置专用参数及 `*args` / `**kwargs` 都会拒绝暴露，并在日志和 `/cmdtools` 中显示原因，不退回字符串模式。
 
 每个字符串最多 2000 字符；全部参数填充默认值后形成的展示文本（含分隔空格）合计最多 2000 字符。缺少必填字段、多余字段、类型错误和超长输入都会明确报错。
 
@@ -103,7 +103,7 @@ async def add(self, event, a: int, b: int = 2):
 - 复用原命令和父指令组的权限、平台、消息类型及自定义过滤器；父组禁用也会阻止子命令。
 - 不经过完整的消息/LLM 流水线，因此不会因模拟命令而再次触发默认模型回复。
 - 命令使用独立事件，结果、停止标志、会话对象与参数信息不会污染原聊天事件。媒体发送使用原聊天事件的适配器接口，并产生正常的发送标记。命令对数据库、插件状态等产生的业务效果仍然存在。
-- 启动、插件加载和卸载时同步工具。命令在 WebUI 重命名或启停后，可以发送 `/command_tools` 刷新；旧工具即使仍在某次模型请求中，也会重新校验后拒绝失效调用。参数声明变化后，旧工具拒绝执行，刷新会生成新声明并保留工具停用状态。
+- 启动、插件加载和卸载时同步工具。命令在 WebUI 重命名或启停后，可以发送 `/cmdtools` 刷新；旧工具即使仍在某次模型请求中，也会重新校验后拒绝失效调用。参数声明变化后，旧工具拒绝执行，刷新会生成新声明并保留工具停用状态。
 - 在工具管理中停用的工具不会因刷新被重新激活；停用本插件会清理其工具并使缓存调用失效。
 
 同一 `插件名:命令` 对应多个处理器时拒绝暴露，不任意挑选。不同插件的同名命令通过插件名区分。
