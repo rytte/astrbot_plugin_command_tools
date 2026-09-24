@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import MessageChain, filter
-from astrbot.api.message_components import At, File, Image, Plain
+from astrbot.api.message_components import At, File, Image, Plain, Record
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.star.filter.command import CommandFilter, GreedyStr
@@ -329,15 +329,26 @@ async def test_timeout_cancels_handler_and_reports_partial_output(env):
 
 
 @pytest.mark.parametrize("reply_method", ["send", "yield", "return", "set_result"])
-async def test_media_reply_interfaces_preserve_chain_and_event(env, reply_method):
-    reply = env.event.chain_result(
-        [
-            Plain("合成结果："),
-            Image.fromURL("https://example.com/image.png"),
-            Plain("附件"),
-            File(name="result.txt", url="https://example.com/result.txt"),
-        ]
-    )
+@pytest.mark.parametrize("reply_type", ["media", "at", "at_text", "at_media"])
+async def test_reply_interfaces_preserve_chain_and_event(env, reply_method, reply_type):
+    components = []
+    expected_output = "已向当前会话发送 1 条命令回复消息。"
+    if reply_type.startswith("at"):
+        components.append(At(qq="123", name="User"))
+    if reply_type == "at_text":
+        components.extend([Plain("处理完成"), At(qq=456)])
+        expected_output = "处理完成"
+    elif reply_type in {"media", "at_media"}:
+        components.extend(
+            [
+                Plain("合成结果："),
+                Image.fromURL("https://example.com/image.png"),
+                Plain("附件"),
+                File(name="result.txt", url="https://example.com/result.txt"),
+            ]
+        )
+        expected_output = "合成结果：附件"
+    reply = env.event.chain_result(components)
     reply.use_markdown_ = False
     reply.stop_event()
     env.event.set_result("outer result")
@@ -354,16 +365,17 @@ async def test_media_reply_interfaces_preserve_chain_and_event(env, reply_method
 
     async def generator(self, event):
         yield reply
-        pytest.fail("A stopped media reply must stop the handler")
+        pytest.fail("A stopped reply must stop the handler")
 
     register(env, generator if reply_method == "yield" else echo)
     plugin = await make_plugin(env, ["sample:echo"])
     result = await invoke(env, plugin.tools["sample:echo"])
     assert result["status"] == "ok"
     assert result["sent_messages"] == 1
-    assert result["output"] == "合成结果：附件"
+    assert result["output"] == expected_output
     env.event.send.assert_awaited_once_with(reply)
     assert env.event.send.call_args.args[0] is reply
+    assert reply.chain == components
     assert env.event.session_id == "session"
     assert env.event.get_sender_id() == "user"
     assert env.event.get_result().get_plain_text() == "outer result"
@@ -398,7 +410,7 @@ async def test_media_is_sent_before_temporary_file_cleanup(env, tmp_path, media_
     result = await invoke(env, plugin.tools["sample:echo"])
     assert result["status"] == "ok"
     assert result["sent_messages"] == 1
-    assert result["output"] == "已向当前会话发送 1 条含图片或文件的消息。"
+    assert result["output"] == "已向当前会话发送 1 条命令回复消息。"
     env.event.send.assert_awaited_once()
     assert not asset.exists()
     assert str(asset) not in json.dumps(result)
@@ -422,12 +434,16 @@ async def test_media_generator_sends_in_order_including_final_result(env):
 
 
 @pytest.mark.parametrize("catch_error", [False, True])
-async def test_media_delivery_failure_reports_partial_sends(env, catch_error):
+@pytest.mark.parametrize("reply_type", ["image", "at"])
+async def test_reply_delivery_failure_reports_partial_sends(
+    env, catch_error, reply_type
+):
     env.event.send.side_effect = [None, RuntimeError("platform send failed")]
 
     async def echo(self, event):
         await event.send(MessageChain().message("started"))
-        reply = event.chain_result([Image.fromBytes(b"image")])
+        component = At(qq="123") if reply_type == "at" else Image.fromBytes(b"image")
+        reply = event.chain_result([component])
         await event.send(reply)
         try:
             await event.send(reply)
@@ -471,13 +487,22 @@ async def test_media_send_is_covered_by_command_timeout(env):
 async def test_unsupported_component_rejects_whole_reply(env):
     async def echo(self, event):
         event.set_result(
-            event.chain_result([Plain("text"), Image.fromBytes(b"image"), At(qq="123")])
+            event.chain_result(
+                [
+                    Plain("text"),
+                    At(qq="123"),
+                    Image.fromBytes(b"image"),
+                    Record.fromURL("https://example.com/audio.mp3"),
+                ]
+            )
         )
 
     register(env, echo)
     plugin = await make_plugin(env, ["sample:echo"])
     result = await invoke(env, plugin.tools["sample:echo"])
-    assert result["status"] == "error" and "At" in result["error"]
+    assert (
+        result["status"] == "error" and "不支持的消息组件：Record；" in result["error"]
+    )
     assert result["sent_messages"] == 0 and result["output"] == ""
     env.event.send.assert_not_awaited()
 
