@@ -9,7 +9,18 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import MessageChain, filter
-from astrbot.api.message_components import At, File, Image, Plain, Record
+from astrbot.api.message_components import (
+    At,
+    File,
+    Forward,
+    Image,
+    Json,
+    Node,
+    Nodes,
+    Plain,
+    Record,
+    Video,
+)
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.star.filter.command import CommandFilter, GreedyStr
@@ -329,7 +340,20 @@ async def test_timeout_cancels_handler_and_reports_partial_output(env):
 
 
 @pytest.mark.parametrize("reply_method", ["send", "yield", "return", "set_result"])
-@pytest.mark.parametrize("reply_type", ["media", "at", "at_text", "at_media"])
+@pytest.mark.parametrize(
+    "reply_type",
+    [
+        "media",
+        "at",
+        "at_text",
+        "at_media",
+        "record",
+        "video",
+        "node",
+        "nodes",
+        "forward",
+    ],
+)
 async def test_reply_interfaces_preserve_chain_and_event(env, reply_method, reply_type):
     components = []
     expected_output = "已向当前会话发送 1 条命令回复消息。"
@@ -348,6 +372,37 @@ async def test_reply_interfaces_preserve_chain_and_event(env, reply_method, repl
             ]
         )
         expected_output = "合成结果：附件"
+    elif reply_type == "record":
+        components.append(Record.fromURL("https://example.com/audio.mp3"))
+    elif reply_type == "video":
+        components.append(Video.fromURL("https://example.com/video.mp4"))
+    elif reply_type in {"node", "nodes"}:
+        node = Node(
+            uin="123",
+            name="Author",
+            content=[
+                Plain("转发内容"),
+                At(qq="456"),
+                Image.fromBytes(b"image"),
+                Record.fromURL("https://example.com/audio.mp3"),
+                Video.fromURL("https://example.com/video.mp4"),
+                File(name="result.txt", url="https://example.com/result.txt"),
+            ],
+        )
+        if reply_type == "node":
+            components.append(node)
+        else:
+            components.extend(
+                [
+                    Plain("聊天记录："),
+                    Nodes(
+                        [node, Node(uin="456", name="Other", content=[Nodes([node])])]
+                    ),
+                ]
+            )
+            expected_output = "聊天记录："
+    elif reply_type == "forward":
+        components.append(Forward(id="forward-id"))
     reply = env.event.chain_result(components)
     reply.use_markdown_ = False
     reply.stop_event()
@@ -382,7 +437,9 @@ async def test_reply_interfaces_preserve_chain_and_event(env, reply_method, repl
     assert not env.event.is_stopped()
 
 
-@pytest.mark.parametrize("media_type", ["url", "base64", "local", "file"])
+@pytest.mark.parametrize(
+    "media_type", ["url", "base64", "local", "file", "record", "video", "nodes"]
+)
 async def test_media_is_sent_before_temporary_file_cleanup(env, tmp_path, media_type):
     asset = tmp_path / "result.png"
     asset.write_bytes(b"generated media")
@@ -391,6 +448,20 @@ async def test_media_is_sent_before_temporary_file_cleanup(env, tmp_path, media_
         "base64": Image.fromBytes(b"generated media"),
         "local": Image.fromFileSystem(str(asset)),
         "file": File(name=asset.name, file=str(asset)),
+        "record": Record.fromFileSystem(str(asset)),
+        "video": Video.fromFileSystem(str(asset)),
+        "nodes": Nodes(
+            [
+                Node(
+                    uin="123",
+                    name="Author",
+                    content=[
+                        Record.fromFileSystem(str(asset)),
+                        Video.fromFileSystem(str(asset)),
+                    ],
+                )
+            ]
+        ),
     }[media_type]
 
     async def platform_send(message):
@@ -434,7 +505,7 @@ async def test_media_generator_sends_in_order_including_final_result(env):
 
 
 @pytest.mark.parametrize("catch_error", [False, True])
-@pytest.mark.parametrize("reply_type", ["image", "at"])
+@pytest.mark.parametrize("reply_type", ["image", "at", "record", "video", "nodes"])
 async def test_reply_delivery_failure_reports_partial_sends(
     env, catch_error, reply_type
 ):
@@ -442,7 +513,13 @@ async def test_reply_delivery_failure_reports_partial_sends(
 
     async def echo(self, event):
         await event.send(MessageChain().message("started"))
-        component = At(qq="123") if reply_type == "at" else Image.fromBytes(b"image")
+        component = {
+            "image": Image.fromBytes(b"image"),
+            "at": At(qq="123"),
+            "record": Record.fromURL("https://example.com/audio.mp3"),
+            "video": Video.fromURL("https://example.com/video.mp4"),
+            "nodes": Nodes([Node(uin="123", name="Author", content=[Plain("text")])]),
+        }[reply_type]
         reply = event.chain_result([component])
         await event.send(reply)
         try:
@@ -484,7 +561,16 @@ async def test_media_send_is_covered_by_command_timeout(env):
     assert cancelled == [True]
 
 
-async def test_unsupported_component_rejects_whole_reply(env):
+@pytest.mark.parametrize("wrapper", ["direct", "node", "nodes", "nested"])
+async def test_unsupported_component_rejects_whole_reply(env, wrapper):
+    component = Json({"app": "unsupported"})
+    if wrapper != "direct":
+        component = Node(uin="123", name="Author", content=[component])
+    if wrapper in {"nodes", "nested"}:
+        component = Nodes([component])
+    if wrapper == "nested":
+        component = Nodes([Node(uin="456", name="Other", content=[component])])
+
     async def echo(self, event):
         event.set_result(
             event.chain_result(
@@ -493,6 +579,7 @@ async def test_unsupported_component_rejects_whole_reply(env):
                     At(qq="123"),
                     Image.fromBytes(b"image"),
                     Record.fromURL("https://example.com/audio.mp3"),
+                    component,
                 ]
             )
         )
@@ -500,9 +587,7 @@ async def test_unsupported_component_rejects_whole_reply(env):
     register(env, echo)
     plugin = await make_plugin(env, ["sample:echo"])
     result = await invoke(env, plugin.tools["sample:echo"])
-    assert (
-        result["status"] == "error" and "不支持的消息组件：Record；" in result["error"]
-    )
+    assert result["status"] == "error" and "不支持的消息组件：Json；" in result["error"]
     assert result["sent_messages"] == 0 and result["output"] == ""
     env.event.send.assert_not_awaited()
 
