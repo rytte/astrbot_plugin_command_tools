@@ -1,6 +1,6 @@
 name: astrbot_plugin_command_tools
 display_name: 命令转模型工具
-desc: 将白名单中的 AstrBot 命令转换为结构化参数模型工具，支持文本、图片与文件回复，保留调用者权限与会话限制。
-version: v0.3.0
+desc: 将 AstrBot 及其插件的命令转换为模型可以自主调用的工具，让机器人帮你执行命令。
+version: 0.4.0
 author: rytte
 astrbot_version: ">=4.27,<5"
