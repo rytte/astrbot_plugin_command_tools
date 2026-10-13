@@ -1,6 +1,7 @@
 name: astrbot_plugin_command_tools
-display_name: 命令转模型工具
+display_name: 指令工具转换器
 desc: 将 AstrBot 及其插件的命令转换为模型可以自主调用的工具，让机器人帮你执行命令。
-version: 0.5.0
+version: 0.6.0
 author: rytte
+repo: https://github.com/rytte/astrbot_plugin_command_tools
 astrbot_version: ">=4.27,<5"

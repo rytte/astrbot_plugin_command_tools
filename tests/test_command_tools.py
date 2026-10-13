@@ -78,7 +78,7 @@ async def make_plugin(env, allowed):
 
     Args:
         env: Isolated environment.
-        allowed: Qualified command selectors.
+        allowed: Plugin names or qualified command selectors.
 
     Returns:
         Initialized plugin instance.
@@ -110,7 +110,15 @@ async def invoke(env, tool, **arguments):
     [
         {"legacy_commands": []},
         {"allowed_commands": "help"},
-        {"allowed_commands": ["help"]},
+        {"allowed_commands": [""]},
+        {"allowed_commands": ["sample other"]},
+        {"allowed_commands": ["sample:"]},
+        {"allowed_commands": ["/sample"]},
+        {"allowed_commands": ["sample*"]},
+        {"allowed_commands": ["sample:math  add"]},
+        {"allowed_commands": [" sample"]},
+        {"allowed_commands": ["sample "]},
+        {"allowed_commands": ["sample:echo:extra"]},
         {"allowed_commands": ["builtin_commands:/help"]},
         {"allowed_commands": ["*:help"]},
         {"allowed_commands": [1]},
@@ -131,7 +139,309 @@ async def test_empty_allowlist_and_unknown_selector(env):
     register(env, echo)
     assert not (await make_plugin(env, [])).tools
     assert not (await make_plugin(env, ["sample:missing"])).tools
+    assert not (await make_plugin(env, ["absent"])).tools
     assert env.manager.func_list == []
+
+
+@pytest.mark.parametrize("extra_allowed", [[], ["other:echo"]])
+async def test_plugin_allowlist_registers_all_commands_and_matches_exact_owner(
+    env, monkeypatch, extra_allowed
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    async def child(self, event, value: int):
+        event.set_result(str(value))
+
+    async def nested(self, event):
+        event.set_result("nested")
+
+    register(env, echo)
+    register(env, child, command="add", parents=["math"])
+    register(env, nested, command="leaf", parents=["root child"])
+    for name in ["other", "sample_extra"]:
+        module = f"tests.{name}"
+        monkeypatch.setitem(
+            env.bridge.star_map,
+            module,
+            StarMetadata(
+                name=name, module_path=module, activated=True, display_name="sample"
+            ),
+        )
+        register(env, echo, module=module)
+        register(env, child, command="add", module=module)
+    plugin = await make_plugin(env, ["sample", *extra_allowed])
+    assert set(plugin.tools) == {
+        "sample:echo",
+        "sample:math add",
+        "sample:root child leaf",
+        *extra_allowed,
+    }
+    assert plugin.allowed == {"sample", *extra_allowed}
+    assert len(env.manager.func_list) == len(plugin.tools)
+    assert (await invoke(env, plugin.tools["sample:echo"]))["output"] == "ok"
+    await plugin.list_commands(env.event)
+    listing = env.event.get_result().get_plain_text()
+    assert "[整插件持续授权；已注册 3/3 个命令] sample" in listing
+    assert "[已注册] sample:math add（整插件授权）" in listing
+    assert "[未加入白名单] sample_extra:echo" in listing
+    assert "[未找到] sample" not in listing
+
+
+async def test_plugin_allowlist_persists_across_new_commands_rename_and_reload(
+    env, monkeypatch
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    async def added(self, event):
+        event.set_result("added")
+
+    plugin = await make_plugin(env, ["sample"])
+    assert not plugin.tools
+    handler, command_filter = register(env, echo)
+    await plugin.on_ready()
+    original_tool = plugin.tools["sample:echo"]
+    assert (await invoke(env, original_tool))["output"] == "ok"
+    register(env, added, command="new", parents=["math"])
+    metadata = env.bridge.star_map["tests.commands"]
+    await plugin.on_loaded(metadata)
+    assert set(plugin.tools) == {"sample:echo", "sample:math new"}
+    command_filter.command_name = "renamed"
+    command_filter._cmpl_cmd_names = None
+    assert (await invoke(env, original_tool))["status"] == "error"
+    await plugin.refresh()
+    assert set(plugin.tools) == {"sample:renamed", "sample:math new"}
+    assert (await invoke(env, plugin.tools["sample:renamed"]))["output"] == "ok"
+    env.registry.remove(handler)
+    assert (await invoke(env, plugin.tools["sample:renamed"]))["status"] == "error"
+    env.registry.clear()
+    monkeypatch.delitem(env.bridge.star_map, "tests.commands")
+    await plugin.on_unloaded(metadata)
+    assert not plugin.tools and not env.manager.func_list
+    assert plugin.allowed == {"sample"}
+    monkeypatch.setitem(env.bridge.star_map, "tests.commands", metadata)
+    register(env, echo)
+    await plugin.on_loaded(metadata)
+    assert plugin.allowed == {"sample"}
+    assert plugin.config["allowed_commands"] == ["sample"]
+    assert plugin.tools["sample:echo"] is not original_tool
+    assert (await invoke(env, original_tool))["status"] == "error"
+    assert (await invoke(env, plugin.tools["sample:echo"]))["output"] == "ok"
+
+
+async def test_exact_command_allowlist_does_not_expand_to_siblings_or_children(env):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    async def child(self, event):
+        event.set_result("child")
+
+    register(env, echo)
+    register(env, child, parents=["echo"])
+    plugin = await make_plugin(env, ["sample:echo"])
+    assert set(plugin.tools) == {"sample:echo"}
+
+
+async def test_refresh_preserves_unchanged_tools_and_updates_description_in_place(
+    env, monkeypatch
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    async def other(self, event):
+        event.set_result("other")
+
+    handler, _ = register(env, echo)
+    register(env, other, command="other")
+    plugin = await make_plugin(env, ["sample"])
+    original_tools = dict(plugin.tools)
+    external = SimpleNamespace(name="external")
+    env.manager.func_list.insert(1, external)
+    tool_list = env.manager.func_list
+    original_order = list(tool_list)
+    add_tools = Mock(wraps=env.context.add_llm_tools)
+    monkeypatch.setattr(env.context, "add_llm_tools", add_tools)
+    await plugin.refresh()
+    await plugin.on_ready()
+    await plugin.list_commands(env.event)
+    assert env.manager.func_list is tool_list
+    assert all(
+        actual is expected for actual, expected in zip(tool_list, original_order)
+    )
+    assert plugin.tools == original_tools
+    add_tools.assert_not_called()
+
+    handler.desc = "Updated command description"
+    original_tools["sample:echo"].active = False
+    monkeypatch.setattr(
+        env.bridge.sp,
+        "get_async",
+        AsyncMock(return_value=[original_tools["sample:other"].name]),
+    )
+    await plugin.refresh()
+    assert plugin.tools == original_tools
+    assert "Updated command description" in original_tools["sample:echo"].description
+    assert not original_tools["sample:echo"].active
+    assert not original_tools["sample:other"].active
+    add_tools.assert_not_called()
+
+
+async def test_refresh_registers_only_added_changed_or_missing_tools(env, monkeypatch):
+    async def echo(self, event, value: int = 1):
+        event.set_result(str(value))
+
+    async def other(self, event):
+        event.set_result("other")
+
+    async def added(self, event):
+        event.set_result("added")
+
+    handler, _ = register(env, echo)
+    register(env, other, command="other")
+    plugin = await make_plugin(env, ["sample"])
+    original = plugin.tools["sample:echo"]
+    unchanged = plugin.tools["sample:other"]
+    external = SimpleNamespace(name="external")
+    env.manager.func_list.append(external)
+    add_tools = Mock(wraps=env.context.add_llm_tools)
+    monkeypatch.setattr(env.context, "add_llm_tools", add_tools)
+    added_handler, _ = register(env, added, command="added")
+    await plugin.refresh()
+    added_tool = plugin.tools["sample:added"]
+    add_tools.assert_called_once_with(added_tool)
+    assert plugin.tools["sample:echo"] is original
+    assert plugin.tools["sample:other"] is unchanged
+
+    async def changed(event, value: str = "new"):
+        event.set_result(value)
+
+    original.active = False
+    handler.handler = changed
+    add_tools.reset_mock()
+    await plugin.refresh()
+    replacement = plugin.tools["sample:echo"]
+    assert replacement is not original and not replacement.active
+    assert original not in env.manager.func_list
+    assert plugin.tools["sample:other"] is unchanged
+    add_tools.assert_called_once_with(replacement)
+    assert (await invoke(env, original))["status"] == "error"
+    replacement.active = True
+    assert (await invoke(env, replacement))["output"] == "new"
+
+    env.registry.remove(added_handler)
+    add_tools.reset_mock()
+    await plugin.refresh()
+    assert "sample:added" not in plugin.tools
+    assert added_tool not in env.manager.func_list
+    assert (await invoke(env, added_tool))["status"] == "error"
+    add_tools.assert_not_called()
+
+    env.manager.func_list.remove(unchanged)
+    await plugin.refresh()
+    add_tools.assert_called_once_with(unchanged)
+    assert plugin.tools["sample:other"] is unchanged
+    assert {id(tool) for tool in env.manager.func_list} == {
+        id(replacement),
+        id(unchanged),
+        id(external),
+    }
+
+
+@pytest.mark.parametrize("event_name", ["on_loaded", "on_unloaded"])
+@pytest.mark.parametrize("allowed", [[], ["sample"], ["sample:echo"]])
+async def test_unrelated_plugin_events_do_not_refresh_or_register_tools(
+    env, monkeypatch, event_name, allowed
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    register(env, echo)
+    plugin = await make_plugin(env, allowed)
+    original_tools = dict(plugin.tools)
+    original_order = list(env.manager.func_list)
+    refresh = AsyncMock(side_effect=AssertionError("Unrelated event must not refresh"))
+    add_tools = Mock(side_effect=AssertionError("Unrelated event must not register"))
+    monkeypatch.setattr(plugin, "refresh", refresh)
+    monkeypatch.setattr(env.context, "add_llm_tools", add_tools)
+    for name in ["other", "sample_extra", None]:
+        await getattr(plugin, event_name)(
+            StarMetadata(name=name, module_path="tests.other", display_name="sample")
+        )
+    assert plugin.tools == original_tools
+    assert env.manager.func_list == original_order
+    refresh.assert_not_awaited()
+    add_tools.assert_not_called()
+
+
+@pytest.mark.parametrize("selector", ["sample", "sample:echo"])
+async def test_allowlisted_plugin_load_refreshes_without_registering_unchanged_tools(
+    env, monkeypatch, selector
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    plugin = await make_plugin(env, [selector])
+    register(env, echo)
+    metadata = env.bridge.star_map["tests.commands"]
+    refresh = AsyncMock(wraps=plugin.refresh)
+    add_tools = Mock(wraps=env.context.add_llm_tools)
+    monkeypatch.setattr(plugin, "refresh", refresh)
+    monkeypatch.setattr(env.context, "add_llm_tools", add_tools)
+    await plugin.on_loaded(metadata)
+    tool = plugin.tools["sample:echo"]
+    refresh.assert_awaited_once()
+    add_tools.assert_called_once_with(tool)
+    await plugin.on_loaded(metadata)
+    assert refresh.await_count == 2
+    add_tools.assert_called_once_with(tool)
+
+
+@pytest.mark.parametrize("selector", ["sample", "sample:echo"])
+async def test_unload_removes_only_target_tools_before_registry_cleanup_and_reload(
+    env, monkeypatch, selector
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    async def unsupported(self, event, values: list[str]):
+        pytest.fail("Unsupported command must not run")
+
+    register(env, echo)
+    register(env, unsupported, command="unsupported")
+    other_metadata = StarMetadata(
+        name="other", module_path="tests.other", activated=True
+    )
+    monkeypatch.setitem(env.bridge.star_map, other_metadata.module_path, other_metadata)
+    register(env, echo, module=other_metadata.module_path)
+    register(env, unsupported, command="unsupported", module=other_metadata.module_path)
+    allowed = [selector, "sample:unsupported", "other"]
+    plugin = await make_plugin(env, allowed)
+    original = plugin.tools["sample:echo"]
+    other_tool = plugin.tools["other:echo"]
+    external = SimpleNamespace(name="external")
+    env.manager.func_list.append(external)
+    add_tools = Mock(wraps=env.context.add_llm_tools)
+    monkeypatch.setattr(env.context, "add_llm_tools", add_tools)
+    metadata = env.bridge.star_map["tests.commands"]
+    await plugin.on_unloaded(metadata)
+    assert "sample:echo" in plugin.catalog()
+    assert plugin.tools == {"other:echo": other_tool}
+    assert set(plugin.unsupported) == {"other:unsupported"}
+    assert env.manager.func_list == [other_tool, external]
+    assert plugin.allowed == set(allowed)
+    assert (await invoke(env, original))["status"] == "error"
+    assert (await invoke(env, other_tool))["output"] == "ok"
+    add_tools.assert_not_called()
+
+    await plugin.on_loaded(metadata)
+    replacement = plugin.tools["sample:echo"]
+    assert replacement is not original
+    assert plugin.tools["other:echo"] is other_tool
+    add_tools.assert_called_once_with(replacement)
+    assert set(plugin.unsupported) == {"sample:unsupported", "other:unsupported"}
+    assert (await invoke(env, original))["status"] == "error"
+    assert (await invoke(env, replacement))["output"] == "ok"
 
 
 async def test_real_executor_collects_send_yield_and_result_with_isolation(env):
@@ -176,7 +486,8 @@ async def test_real_executor_collects_send_yield_and_result_with_isolation(env):
     assert tool.handler_module_path == env.bridge.__name__
 
 
-async def test_permission_before_argument_parsing(env):
+@pytest.mark.parametrize("selector", ["sample:echo", "sample"])
+async def test_permission_before_argument_parsing(env, selector):
     calls = []
 
     async def echo(self, event, count: int):
@@ -184,7 +495,7 @@ async def test_permission_before_argument_parsing(env):
         event.set_result(str(count))
 
     register(env, echo, extra_filters=[PermissionTypeFilter(PermissionType.ADMIN)])
-    plugin = await make_plugin(env, ["sample:echo"])
+    plugin = await make_plugin(env, [selector])
     tool = plugin.tools["sample:echo"]
     result = await invoke(env, tool, count="invalid")
     assert result["status"] == "error" and "权限" in result["error"]
@@ -196,7 +507,10 @@ async def test_permission_before_argument_parsing(env):
     assert calls == [3]
 
 
-async def test_parent_group_permissions_disabled_state_and_custom_filters(env):
+@pytest.mark.parametrize("selector", ["sample:group echo", "sample"])
+async def test_parent_group_permissions_disabled_state_and_custom_filters(
+    env, selector
+):
     async def echo(self, event):
         event.set_result("ok")
 
@@ -212,7 +526,7 @@ async def test_parent_group_permissions_disabled_state_and_custom_filters(env):
         [group, PermissionTypeFilter(PermissionType.ADMIN)],
     )
     env.registry.append(parent)
-    plugin = await make_plugin(env, ["sample:group echo"])
+    plugin = await make_plugin(env, [selector])
     tool = plugin.tools["sample:group echo"]
     assert (await invoke(env, tool))["status"] == "error"
     env.event.role = "admin"
@@ -227,7 +541,8 @@ async def test_parent_group_permissions_disabled_state_and_custom_filters(env):
 @pytest.mark.parametrize(
     "denial", ["handler", "plugin", "config", "event", "session", "bridge", "builtin"]
 )
-async def test_call_rechecks_runtime_policy(env, monkeypatch, denial):
+@pytest.mark.parametrize("selector", ["sample:echo", "sample"])
+async def test_call_rechecks_runtime_policy(env, monkeypatch, denial, selector):
     calls = []
 
     async def echo(self, event):
@@ -242,7 +557,7 @@ async def test_call_rechecks_runtime_policy(env, monkeypatch, denial):
             StarMetadata(name="sample", module_path=module, reserved=True),
         )
     handler, _ = register(env, echo, module=module)
-    plugin = await make_plugin(env, ["sample:echo"])
+    plugin = await make_plugin(env, [selector])
     tool = plugin.tools["sample:echo"]
     if denial == "handler":
         handler.enabled = False
@@ -297,7 +612,8 @@ async def test_rename_unload_refresh_and_terminate_invalidate_tools(env):
     assert (await invoke(env, new_tool))["status"] == "error"
 
 
-async def test_conflicts_and_disabled_tool_state(env, monkeypatch):
+@pytest.mark.parametrize("selector", ["sample:echo", "sample"])
+async def test_conflicts_and_disabled_tool_state(env, monkeypatch, selector):
     async def echo(self, event):
         event.set_result("ok")
 
@@ -305,7 +621,7 @@ async def test_conflicts_and_disabled_tool_state(env, monkeypatch):
         event.set_result("wrong")
 
     register(env, echo)
-    plugin = await make_plugin(env, ["sample:echo"])
+    plugin = await make_plugin(env, [selector])
     tool = plugin.tools["sample:echo"]
     tool.active = False
     await plugin.refresh()
@@ -618,7 +934,8 @@ async def test_platform_and_message_type_filters(env):
     assert (await invoke(env, plugin.tools["sample:echo"]))["status"] == "error"
 
 
-async def test_nested_group_and_generator_cleanup(env):
+@pytest.mark.parametrize("selector", ["sample:root child echo", "sample"])
+async def test_nested_group_and_generator_cleanup(env, selector):
     closed = []
 
     async def echo(self, event):
@@ -645,7 +962,8 @@ async def test_nested_group_and_generator_cleanup(env):
                 [group],
             )
         )
-    plugin = await make_plugin(env, ["sample:root child echo"])
+    plugin = await make_plugin(env, [selector])
+    assert set(plugin.tools) == {"sample:root child echo"}
     result = await invoke(env, plugin.tools["sample:root child echo"])
     assert result["status"] == "ok" and result["output"] == "done"
     assert closed == [True]
@@ -671,12 +989,13 @@ async def test_invalid_model_arguments_do_not_execute(env, kwargs):
     assert result["status"] == "error"
 
 
-async def test_real_session_plugin_policy(env, monkeypatch):
+@pytest.mark.parametrize("selector", ["sample:echo", "sample"])
+async def test_real_session_plugin_policy(env, monkeypatch, selector):
     async def echo(self, event):
         pytest.fail("A session-disabled plugin must not run")
 
     register(env, echo)
-    plugin = await make_plugin(env, ["sample:echo"])
+    plugin = await make_plugin(env, [selector])
     monkeypatch.setattr(
         env.bridge.SessionPluginManager,
         "filter_handlers_by_session",
@@ -740,7 +1059,10 @@ async def test_registration_collision_is_not_overwritten(env):
     assert env.manager.func_list == [tool, unrelated]
 
 
-async def test_builtin_help_provider_and_lifecycle_exclusion(env, monkeypatch):
+@pytest.mark.parametrize("allow_plugin", [False, True])
+async def test_builtin_help_provider_and_lifecycle_exclusion(
+    env, monkeypatch, allow_plugin
+):
     import astrbot.builtin_stars.builtin_commands.commands.help as help_module
     from astrbot.builtin_stars.builtin_commands.commands.help import HelpCommand
     from astrbot.builtin_stars.builtin_commands.commands.provider import (
@@ -786,7 +1108,9 @@ async def test_builtin_help_provider_and_lifecycle_exclusion(env, monkeypatch):
     register(env, Builtins.reset, command="reset", module=module)
     plugin = await make_plugin(
         env,
-        [
+        ["builtin_commands"]
+        if allow_plugin
+        else [
             "builtin_commands:help",
             "builtin_commands:provider",
             "builtin_commands:reset",
@@ -979,8 +1303,9 @@ async def test_resolved_annotations_default_inference_and_keyword_only_params(en
         "value: int, /",
     ],
 )
+@pytest.mark.parametrize("allow_plugin", [False, True])
 async def test_unsupported_declarations_are_reported_without_breaking_other_tools(
-    env, declaration
+    env, declaration, allow_plugin
 ):
     namespace = {}
     exec(f"async def unsupported(self, event, {declaration}):\n    pass", namespace)
@@ -990,7 +1315,9 @@ async def test_unsupported_declarations_are_reported_without_breaking_other_tool
         event.set_result("ok")
 
     register(env, echo)
-    plugin = await make_plugin(env, ["sample:echo", "sample:unsupported"])
+    plugin = await make_plugin(
+        env, ["sample"] if allow_plugin else ["sample:echo", "sample:unsupported"]
+    )
     assert list(plugin.tools) == ["sample:echo"]
     assert "sample:unsupported" in plugin.unsupported
     assert (await invoke(env, plugin.tools["sample:echo"]))["output"] == "ok"
@@ -1201,12 +1528,15 @@ async def test_management_persists_add_remove_and_invalidates_cached_tool(
     }
 
 
-async def test_management_handles_full_subcommand_and_missing_entries(env, management):
+@pytest.mark.parametrize("arguments", ["add sample:math add", "add sample:math  add"])
+async def test_management_handles_full_subcommand_and_missing_entries(
+    env, management, arguments
+):
     async def echo(self, event):
         pass
 
     register(env, echo, command="add", parents=["math"])
-    reply = await management.send("add sample:math add")
+    reply = await management.send(arguments)
     assert "已注册" in reply
     assert "sample:math add" in management.plugin.tools
     assert "未找到" in await management.send("add absent:old command")
@@ -1221,11 +1551,134 @@ async def test_management_handles_full_subcommand_and_missing_entries(env, manag
     assert not management.plugin.tools
 
 
+async def test_management_persists_plugin_authorization_and_reports_command_states(
+    env, management
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    async def disabled(self, event):
+        pytest.fail("Disabled command must not run")
+
+    async def unsupported(self, event, values: list[str]):
+        pytest.fail("Unsupported command must not run")
+
+    register(env, echo)
+    handler, _ = register(env, disabled, command="disabled")
+    handler.enabled = False
+    register(env, unsupported, command="unsupported")
+    reply = await management.send("add sample")
+    assert "整插件持续授权" in reply and "新增命令刷新后自动纳入" in reply
+    assert "已注册 1/3 个命令" in reply
+    assert set(management.plugin.tools) == {"sample:echo"}
+    assert management.config["allowed_commands"] == ["sample"]
+    saved = json.loads(management.path.read_text(encoding="utf-8-sig"))
+    assert saved == {"allowed_commands": ["sample"], "command_timeout": 7}
+    reloaded_config = AstrBotConfig(
+        str(management.path), default_config=management.config.default_config
+    )
+    assert env.bridge.Main(env.context, reloaded_config).allowed == {"sample"}
+    listing = await management.send()
+    assert "[整插件持续授权；已注册 1/3 个命令] sample" in listing
+    assert "[原命令/插件已禁用] sample:disabled（整插件授权）" in listing
+    assert "[参数不支持：" in listing and "sample:unsupported（整插件授权）" in listing
+    tool = management.plugin.tools["sample:echo"]
+    assert (await invoke(env, tool))["output"] == "ok"
+    reply = await management.send("remove sample")
+    assert "已撤销整插件持续授权" in reply and "已注册 0/3 个命令" in reply
+    assert not management.plugin.allowed and not management.plugin.tools
+    assert not env.manager.func_list
+    assert (await invoke(env, tool))["status"] == "error"
+    assert (
+        json.loads(management.path.read_text(encoding="utf-8-sig"))["allowed_commands"]
+        == []
+    )
+
+
+@pytest.mark.parametrize("first_removed", ["sample", "sample:echo"])
+async def test_management_overlapping_authorizations_remain_independent(
+    env, management, first_removed
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    async def other(self, event):
+        event.set_result("other")
+
+    register(env, echo)
+    register(env, other, command="other")
+    await management.send("add sample")
+    await management.send("add sample:echo")
+    tool = management.plugin.tools["sample:echo"]
+    other_tool = management.plugin.tools["sample:other"]
+    reply = await management.send(f"remove {first_removed}")
+    assert "已移出白名单并保存" in reply
+    assert "对应工具已移除" not in reply
+    if first_removed == "sample":
+        assert "单独加入白名单的命令仍保留授权" in reply
+        assert "已注册 1/2 个命令" in reply
+        remaining = "sample:echo"
+        assert set(management.plugin.tools) == {"sample:echo"}
+        assert (await invoke(env, other_tool))["status"] == "error"
+    else:
+        assert "仍由整插件持续授权覆盖" in reply
+        remaining = "sample"
+        assert set(management.plugin.tools) == {"sample:echo", "sample:other"}
+        assert (await invoke(env, other_tool))["output"] == "other"
+    assert management.config["allowed_commands"] == [remaining]
+    assert (await invoke(env, tool))["output"] == "ok"
+    await management.send(f"remove {remaining}")
+    assert not management.plugin.allowed and not management.plugin.tools
+    assert (await invoke(env, tool))["status"] == "error"
+
+
+async def test_management_removing_command_covered_only_by_plugin_does_not_save(
+    env, management, monkeypatch
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    register(env, echo)
+    await management.send("add sample")
+    save = Mock(side_effect=AssertionError("No-op changes must not be saved"))
+    monkeypatch.setattr(AstrBotConfig, "save_config", save)
+    reply = await management.send("remove sample:echo")
+    assert "没有单独的白名单条目" in reply and "仍由整插件持续授权覆盖" in reply
+    assert management.config["allowed_commands"] == ["sample"]
+    assert (await invoke(env, management.plugin.tools["sample:echo"]))["output"] == "ok"
+    save.assert_not_called()
+
+
+async def test_management_unknown_plugin_keeps_authorization_until_loaded(
+    env, management, monkeypatch
+):
+    async def echo(self, event):
+        event.set_result("ok")
+
+    register(env, echo)
+    reply = await management.send("add absent")
+    assert "插件未找到" in reply and "整插件持续授权" in reply
+    assert management.config["allowed_commands"] == ["absent"]
+    assert not management.plugin.tools
+    listing = await management.send()
+    assert "[整插件持续授权；插件未找到] absent" in listing
+    assert "[未加入白名单] sample:echo" in listing
+    metadata = StarMetadata(name="absent", module_path="tests.absent", activated=True)
+    monkeypatch.setitem(env.bridge.star_map, metadata.module_path, metadata)
+    register(env, echo, module=metadata.module_path)
+    await management.plugin.on_loaded(metadata)
+    assert set(management.plugin.tools) == {"absent:echo"}
+    assert (await invoke(env, management.plugin.tools["absent:echo"]))["output"] == "ok"
+    assert "[整插件持续授权；已注册 1/1 个命令] absent" in await management.send()
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
         "add sample:echo",
         "remove sample:echo",
+        "add sample",
+        "remove sample",
         "",
     ],
 )
@@ -1239,7 +1692,10 @@ async def test_management_requires_admin(management, arguments):
     [
         "add",
         "remove",
-        "add help",
+        "add sample other",
+        "add sample:",
+        "add /sample",
+        "add sample*",
         "remove sample:/echo",
         "add *:echo",
         "add sample:echo other:command",
@@ -1257,35 +1713,37 @@ async def test_management_rejects_invalid_input_without_saving(
     save.assert_not_called()
 
 
+@pytest.mark.parametrize("key", ["sample:missing", "sample"])
 async def test_management_duplicate_and_absent_changes_do_not_save(
-    management, monkeypatch
+    management, monkeypatch, key
 ):
-    await management.send("add sample:missing")
+    await management.send(f"add {key}")
     save = Mock(side_effect=AssertionError("No-op changes must not be saved"))
     monkeypatch.setattr(AstrBotConfig, "save_config", save)
-    assert "已在白名单中" in await management.send("add sample:missing")
-    assert "不在白名单中" in await management.send("remove sample:absent")
-    assert management.config["allowed_commands"] == ["sample:missing"]
+    assert "已在白名单中" in await management.send(f"add {key}")
+    assert "不在白名单中" in await management.send("remove absent:command")
+    assert management.config["allowed_commands"] == [key]
     save.assert_not_called()
 
 
 @pytest.mark.parametrize("action", ["add", "remove"])
+@pytest.mark.parametrize("selector", ["sample:echo", "sample"])
 async def test_management_save_failure_preserves_config_and_tools(
-    env, management, monkeypatch, action
+    env, management, monkeypatch, action, selector
 ):
     async def echo(self, event):
         event.set_result("ok")
 
     register(env, echo)
     if action == "remove":
-        await management.send("add sample:echo")
+        await management.send(f"add {selector}")
     previous_config = dict(management.config)
     previous_tools = dict(management.plugin.tools)
     previous_file = management.path.read_bytes()
     monkeypatch.setattr(
         AstrBotConfig, "save_config", Mock(side_effect=OSError("Disk unavailable"))
     )
-    reply = await management.send(f"{action} sample:echo")
+    reply = await management.send(f"{action} {selector}")
     assert "保存白名单失败" in reply and "未生效" in reply
     assert management.config == previous_config
     assert management.path.read_bytes() == previous_file
@@ -1294,19 +1752,20 @@ async def test_management_save_failure_preserves_config_and_tools(
     assert env.manager.func_list == list(previous_tools.values())
 
 
+@pytest.mark.parametrize("selector", ["sample:echo", "sample"])
 async def test_management_reports_refresh_failure_and_still_revokes_command(
-    env, management, monkeypatch
+    env, management, monkeypatch, selector
 ):
     async def echo(self, event):
         pytest.fail("Removed command must not execute even if refresh fails")
 
     register(env, echo)
-    await management.send("add sample:echo")
+    await management.send(f"add {selector}")
     tool = management.plugin.tools["sample:echo"]
     monkeypatch.setattr(
         management.plugin, "refresh", AsyncMock(side_effect=ValueError("Tool conflict"))
     )
-    reply = await management.send("remove sample:echo")
+    reply = await management.send(f"remove {selector}")
     assert "已移出白名单并保存" in reply and "工具刷新失败" in reply
     assert not management.plugin.allowed
     assert (
@@ -1314,6 +1773,41 @@ async def test_management_reports_refresh_failure_and_still_revokes_command(
         == []
     )
     assert (await invoke(env, tool))["status"] == "error"
+
+
+@pytest.mark.parametrize("selector", ["sample:echo", "sample"])
+async def test_authorization_revoked_during_policy_check_denies_cached_tool(
+    env, management, monkeypatch, selector
+):
+    async def echo(self, event):
+        pytest.fail("Revoked authorization must not execute")
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_policy_check(event, handlers):
+        entered.set()
+        await release.wait()
+        return handlers
+
+    register(env, echo)
+    await management.send(f"add {selector}")
+    tool = management.plugin.tools["sample:echo"]
+    monkeypatch.setattr(
+        env.bridge.SessionPluginManager,
+        "filter_handlers_by_session",
+        delayed_policy_check,
+    )
+    invocation = asyncio.create_task(invoke(env, tool))
+    await entered.wait()
+    monkeypatch.setattr(
+        management.plugin, "refresh", AsyncMock(side_effect=ValueError("Tool conflict"))
+    )
+    reply = await management.send(f"remove {selector}")
+    assert "工具刷新失败" in reply
+    release.set()
+    result = await invocation
+    assert result["status"] == "error" and "已移出白名单" in result["error"]
 
 
 async def test_management_serializes_edits_and_rejects_changes_after_termination(

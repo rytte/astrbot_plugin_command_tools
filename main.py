@@ -46,7 +46,7 @@ BUILTIN_MODULE = "astrbot.builtin_stars.builtin_commands.main"
 UNSUPPORTED_HANDLERS = {"reset", "stop", "new_conv", "update_dashboard"}
 MAX_OUTPUT = 16000
 DIRECT_REPLY_COMPONENTS = (At, Image, File, Record, Video, Node, Nodes, Forward)
-COMMAND_SELECTOR = re.compile(r"[^\s:/*]+:[^\s:/*]+(?: [^\s:/*]+)*")
+ALLOWLIST_SELECTOR = re.compile(r"[^\s:/*]+(?::[^\s:/*]+(?: [^\s:/*]+)*)?")
 
 
 class CommandEvent(AstrMessageEvent):
@@ -269,11 +269,12 @@ class Main(Star):
             raise ValueError(f"未知配置字段：{', '.join(sorted(unknown))}")
         allowed = config.get("allowed_commands", [])
         if not isinstance(allowed, list) or any(
-            not isinstance(key, str) or not COMMAND_SELECTOR.fullmatch(key)
+            not isinstance(key, str) or not ALLOWLIST_SELECTOR.fullmatch(key)
             for key in allowed
         ):
             raise ValueError(
-                "allowed_commands 必须为插件名:命令的列表，不含 / 或通配符。"
+                "allowed_commands 必须为插件名或插件名:完整命令名的列表，"
+                "不含 / 或通配符。"
             )
         timeout = config.get("command_timeout", 30)
         if (
@@ -289,6 +290,10 @@ class Main(Star):
         self.tools: dict[str, CommandTool] = {}
         self.unsupported: dict[str, str] = {}
         self.closed = False
+
+    def is_allowed(self, key: str) -> bool:
+        """Match an exact command or its plugin's persistent authorization."""
+        return key in self.allowed or key.partition(":")[0] in self.allowed
 
     def catalog(self) -> dict[str, list[tuple[StarHandlerMetadata, CommandFilter]]]:
         """Read current canonical commands, retaining conflicts for rejection.
@@ -330,7 +335,7 @@ class Main(Star):
         updated = {}
         unsupported = {}
         for key, entries in self.catalog().items():
-            if key not in self.allowed or len(entries) != 1:
+            if not self.is_allowed(key) or len(entries) != 1:
                 continue
             handler, command_filter = entries[0]
             metadata = star_map[handler.handler_module_path]
@@ -367,14 +372,17 @@ class Main(Star):
             if tool.name in disabled:
                 tool.active = False
             updated[key] = tool
-        old_ids = {id(tool) for tool in self.tools.values()}
+        updated_ids = {id(tool) for tool in updated.values()}
+        removed_ids = {id(tool) for tool in self.tools.values()} - updated_ids
         manager.func_list[:] = [
-            tool for tool in manager.func_list if id(tool) not in old_ids
+            tool for tool in manager.func_list if id(tool) not in removed_ids
         ]
+        registered_ids = {id(tool) for tool in manager.func_list}
         self.tools = updated
         self.unsupported = unsupported
         for tool in updated.values():
-            self.context.add_llm_tools(tool)
+            if id(tool) not in registered_ids:
+                self.context.add_llm_tools(tool)
 
     async def execute(
         self, tool: CommandTool, event: CommandEvent, arguments: dict
@@ -392,7 +400,7 @@ class Main(Star):
             NotImplementedError: The command needs unsupported pipeline behavior.
         """
         entries = self.catalog().get(tool.key, [])
-        if tool.key not in self.allowed or len(entries) != 1:
+        if not self.is_allowed(tool.key) or len(entries) != 1:
             raise ValueError("命令不在白名单、已被重命名/卸载，或存在同名冲突。")
         handler, command_filter = entries[0]
         if handler.handler_full_name != tool.handler_id:
@@ -484,6 +492,8 @@ class Main(Star):
                     "目标插件、命令或父指令组已禁用，或不在当前会话的可用插件中。"
                 )
         current_entries = self.catalog().get(tool.key, [])
+        if not self.is_allowed(tool.key):
+            raise PermissionError("命令在权限检查期间已移出白名单。")
         if len(current_entries) != 1 or current_entries[0][0] is not handler:
             raise ValueError("命令在权限检查期间已变更。")
         # Check all permission decorators before argument parsing or custom filters.
@@ -576,21 +586,41 @@ class Main(Star):
 
     @filter.on_plugin_loaded()
     async def on_loaded(self, metadata: StarMetadata) -> None:
-        """Refresh after a plugin load.
+        """Refresh only when the loaded plugin is covered by the allowlist.
 
         Args:
             metadata: Plugin that finished loading.
         """
-        await self.refresh()
+        if any(key.partition(":")[0] == metadata.name for key in self.allowed):
+            await self.refresh()
 
     @filter.on_plugin_unloaded()
     async def on_unloaded(self, metadata: StarMetadata) -> None:
-        """Refresh after a plugin unload.
+        """Remove the unloaded plugin's tools without relying on registry cleanup.
 
         Args:
             metadata: Plugin that finished unloading.
         """
-        await self.refresh()
+        removed_ids = {
+            id(tool)
+            for key, tool in self.tools.items()
+            if key.partition(":")[0] == metadata.name
+        }
+        if removed_ids:
+            manager = self.context.get_llm_tool_manager()
+            manager.func_list[:] = [
+                tool for tool in manager.func_list if id(tool) not in removed_ids
+            ]
+            self.tools = {
+                key: tool
+                for key, tool in self.tools.items()
+                if id(tool) not in removed_ids
+            }
+        self.unsupported = {
+            key: reason
+            for key, reason in self.unsupported.items()
+            if key.partition(":")[0] != metadata.name
+        }
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("cmdtools")
@@ -605,14 +635,14 @@ class Main(Star):
         if action not in {"add", "remove"}:
             event.set_result(
                 "未知子命令。用法：/cmdtools 查看列表；"
-                "/cmdtools add 插件名:完整命令名；"
-                "/cmdtools remove 插件名:完整命令名。"
+                "/cmdtools add 插件名或插件名:完整命令名；"
+                "/cmdtools remove 插件名或插件名:完整命令名。"
             )
             return
-        if not COMMAND_SELECTOR.fullmatch(key):
+        if not ALLOWLIST_SELECTOR.fullmatch(key):
             event.set_result(
-                f"用法：/cmdtools {action} 插件名:完整命令名。"
-                "每次填写一个命令，不含 / 或通配符；"
+                f"用法：/cmdtools {action} 插件名或插件名:完整命令名。"
+                "每次填写一个插件或命令，不含 / 或通配符；"
                 "子命令示例：my_plugin:math add。"
             )
             return
@@ -624,7 +654,13 @@ class Main(Star):
                 event.set_result(f"已在白名单中：{key}")
                 return
             if action == "remove" and key not in self.allowed:
-                event.set_result(f"不在白名单中：{key}")
+                if ":" in key and self.is_allowed(key):
+                    event.set_result(
+                        f"该命令没有单独的白名单条目，仍由整插件持续授权覆盖：{key}。"
+                        "若只想开放部分命令，请移除插件名，改为逐条授权。"
+                    )
+                else:
+                    event.set_result(f"不在白名单中：{key}")
                 return
             previous = dict(self.config)
             allowed = list(self.config.get("allowed_commands", []))
@@ -652,12 +688,37 @@ class Main(Star):
                     "排除错误后发送 /cmdtools 重试刷新。"
                 )
                 return
-            if action == "add":
-                status = self.command_status(key, self.catalog().get(key, []))
+            catalog = self.catalog()
+            if ":" not in key:
+                if action == "add":
+                    result += (
+                        "\n整插件持续授权：包含全部可转换命令及子命令，"
+                        "以后新增命令刷新后自动纳入。"
+                    )
+                else:
+                    result += "\n已撤销整插件持续授权，单独加入白名单的命令仍保留授权。"
+                result += f"\n当前状态：{self.plugin_status(key, catalog)}"
+            elif action == "add":
+                status = self.command_status(key, catalog.get(key, []))
                 result += f"\n当前状态：{status}"
+            elif self.is_allowed(key):
+                status = self.command_status(key, catalog.get(key, []))
+                result += f"\n该命令仍由整插件持续授权覆盖。当前状态：{status}"
             else:
                 result += "\n对应工具已移除。"
             event.set_result(result)
+
+    def plugin_status(
+        self,
+        name: str,
+        catalog: dict[str, list[tuple[StarHandlerMetadata, CommandFilter]]],
+    ) -> str:
+        """Report plugin discovery and current command registration counts."""
+        if not any(metadata.name == name for metadata in star_map.values()):
+            return "插件未找到"
+        commands = [key for key in catalog if key.partition(":")[0] == name]
+        registered = sum(key in self.tools for key in commands)
+        return f"已注册 {registered}/{len(commands)} 个命令"
 
     def command_status(
         self, key: str, entries: list[tuple[StarHandlerMetadata, CommandFilter]]
@@ -675,7 +736,7 @@ class Main(Star):
             return "暂不支持"
         if not handler.enabled or not star_map[handler.handler_module_path].activated:
             return "原命令/插件已禁用"
-        if key not in self.allowed:
+        if not self.is_allowed(key):
             return "未加入白名单"
         if key in self.unsupported:
             return f"参数不支持：{self.unsupported[key]}"
@@ -693,19 +754,26 @@ class Main(Star):
         await self.refresh()
         lines = [
             "命令工具：",
-            "添加：/cmdtools add 插件名:完整命令名",
-            "移除：/cmdtools remove 插件名:完整命令名",
+            "添加：/cmdtools add 插件名或插件名:完整命令名",
+            "移除：/cmdtools remove 插件名或插件名:完整命令名",
             "增删会保存到 allowed_commands 并立即刷新工具，无需重载插件。",
+            "只写插件名即持续授权全部可转换命令及子命令，新增命令刷新后自动纳入。",
         ]
         catalog = self.catalog()
+        for name in sorted(key for key in self.allowed if ":" not in key):
+            lines.append(
+                f"[整插件持续授权；{self.plugin_status(name, catalog)}] {name}"
+            )
         for key, entries in sorted(catalog.items()):
             tool = self.tools.get(key)
             status = self.command_status(key, entries)
-            lines.append(f"[{status}] {key}")
+            suffix = "（整插件授权）" if key.partition(":")[0] in self.allowed else ""
+            lines.append(f"[{status}] {key}{suffix}")
             if tool:
                 lines.append(f"  工具：{tool.name}")
         for key in sorted(self.allowed - catalog.keys()):
-            lines.append(f"[未找到] {key}")
+            if ":" in key:
+                lines.append(f"[未找到] {key}")
         event.set_result("\n".join(lines))
 
     async def terminate(self) -> None:

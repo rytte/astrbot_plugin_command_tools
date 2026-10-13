@@ -1,9 +1,9 @@
 {
   "allowed_commands": {
-    "description": "允许转换为模型工具的命令",
+    "description": "允许转换为模型工具的插件或命令",
     "type": "list",
     "default": [],
-    "hint": "填写 插件名:命令，不加 /，不支持通配符。例如 builtin_commands:help、builtin_commands:provider。子命令示例：my_plugin:math add。管理员可发送 /cmdtools 查看有效名称，使用 /cmdtools add 或 remove 加完整标识增删白名单，自动保存并立即刷新工具。加入白名单会允许模型以当前用户权限执行该命令及其全部参数形式。"
+    "hint": "填写插件名或插件名:完整命令名，如 my_plugin、builtin_commands:help、my_plugin:math add。只写插件名会持续授权全部可转换命令及子命令，新增命令刷新后自动纳入。不加 /，不支持通配符；发送 /cmdtools 查看有效名称。"
   },
   "command_timeout": {
     "description": "单次命令执行超时（秒）",
